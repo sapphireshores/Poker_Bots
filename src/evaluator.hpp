@@ -5,13 +5,13 @@
 #include <vector>
 #include <algorithm>
 #include <iostream>
+#include <string>
 
 using u64 = std::uint64_t;
 constexpr u64 FULL_DECK = (1ULL << 52) - 1;
 
-// Rank & suit mappings
 inline int card_id(int rank, int suit) {
-    return suit * 13 + rank; // rank 0..12 (2..A), suit 0..3 (s,h,d,c)
+    return suit * 13 + rank;
 }
 
 inline u64 suit_slice(u64 bitboard, int suit) {
@@ -27,12 +27,11 @@ inline void for_each_card(u64 mask, F&& f) {
     }
 }
 
-// Global evaluation tables
 extern std::array<std::uint32_t, 8192> FLUSH_TABLE;
 extern std::array<std::uint32_t, 50388> NONFLUSH_TABLE;
 
-// Function declarations
 void init_evaluator_tables();
 std::uint32_t combinadic_index_7(const std::array<int, 7>& sorted_ranks);
 std::uint32_t eval7(u64 hand_bitboard);
 void export_tables_to_python(const std::string& filepath);
+void build_preflop_classes();

@@ -1,3 +1,15 @@
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+
+# Match logs & stderr dumps
 logs/
+**/logs/
+*_stderr.txt
+*_stdout.txt
+
+# Generated lookup tables & build artifacts
+build/
+*.o
+python/tables.py
+python/tables.bin
