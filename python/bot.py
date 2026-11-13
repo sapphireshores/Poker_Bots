@@ -16,8 +16,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LIB_PATH = os.path.join(BASE_DIR, "libpoker_solver.so")
 BIN_PATH = os.path.join(BASE_DIR, "tables.bin").encode("utf-8")
 
-ACTION_BUDGET_MS = 7.5
-DISCARD_BUDGET_MS = 12.0
+ACTION_BUDGET_MS = 8.0
+DISCARD_BUDGET_MS = 10.0
 
 c_lib = None
 if os.path.exists(LIB_PATH):
@@ -40,11 +40,28 @@ if os.path.exists(LIB_PATH):
         ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
         ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
         ctypes.c_double,
-        ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
     ]
     c_lib.py_choose_action.restype = None
     c_lib.py_init_engine(BIN_PATH)
+
+
+def _pair_strength(c1, c2):
+    r1, s1 = RANK_MAP[c1[0]], SUIT_MAP[c1[1]]
+    r2, s2 = RANK_MAP[c2[0]], SUIT_MAP[c2[1]]
+    hi, lo = max(r1, r2), min(r1, r2)
+    score = hi * 20 + lo * 10
+    if r1 == r2:
+        score += 200 + r1 * 15
+    if s1 == s2:
+        score += 28
+    if hi - lo == 1:
+        score += 18
+    elif hi - lo == 2:
+        score += 10
+    return score
 
 
 class OpponentTracker:
@@ -55,58 +72,76 @@ class OpponentTracker:
         self.opp_raises = 0.0
         self.faced_bets = 0.0
         self.folded_to_bets = 0.0
+        self.sd_count = 0
+        self.sd_weak_sum = 0.0
+        self.net_chips = 0
 
-    def update_from_history(self, history):
-        if not history:
-            return
-        self.hands += 1
-        opp_put_money = False
-        my_last_bet = False
-        for entry in history:
-            if isinstance(entry, dict):
-                actor = entry.get("player", entry.get("actor", ""))
-                act = entry.get("action", "")
-                street = entry.get("street")
-            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                actor, act = entry[0], entry[1]
-                street = entry[2] if len(entry) >= 3 else None
-            else:
-                continue
+    def update_from_result(self, msg):
+        history = msg.get("history", [])
+        if history:
+            self.hands += 1
+            opp_put_money = False
+            my_last_bet = False
+            for entry in history:
+                if isinstance(entry, dict):
+                    actor = entry.get("player", entry.get("actor", ""))
+                    act = entry.get("action", "")
+                    street = entry.get("street")
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    actor, act = entry[0], entry[1]
+                    street = entry[2] if len(entry) >= 3 else None
+                else:
+                    continue
 
-            is_opp = (actor in ("opp", 1, "B"))
-            if is_opp:
-                self.opp_actions += 1.0
-                if act in ("call", "raise", "bet") and street in (None, "preflop"):
-                    opp_put_money = True
-                if act in ("raise", "bet"):
-                    self.opp_raises += 1.0
-                if my_last_bet:
-                    self.faced_bets += 1.0
-                    if act == "fold":
-                        self.folded_to_bets += 1.0
-                my_last_bet = False
-            else:
-                if act in ("raise", "bet"):
-                    my_last_bet = True
-                elif act in ("call", "check", "fold"):
+                is_opp = (actor in ("opp", 1, "B"))
+                if is_opp:
+                    self.opp_actions += 1.0
+                    if act in ("call", "raise", "bet") and street in (None, "preflop"):
+                        opp_put_money = True
+                    if act in ("raise", "bet"):
+                        self.opp_raises += 1.0
+                    if my_last_bet:
+                        self.faced_bets += 1.0
+                        if act == "fold":
+                            self.folded_to_bets += 1.0
                     my_last_bet = False
+                else:
+                    if act in ("raise", "bet"):
+                        my_last_bet = True
+                    elif act in ("call", "check", "fold"):
+                        my_last_bet = False
 
-        if opp_put_money:
-            self.vpip_hands += 1
+            if opp_put_money:
+                self.vpip_hands += 1
+
+        # Track cumulative net score for score-cap awareness
+        delta = msg.get("delta", msg.get("my_delta", msg.get("payoff", 0)))
+        if isinstance(delta, (int, float)):
+            self.net_chips += int(delta)
+
+        # Learn from showdown cards & opponent discard choices
+        opp_cards = msg.get("opp_hole_cards")
+        if isinstance(opp_cards, list) and len(opp_cards) >= 2:
+            strength = _pair_strength(opp_cards[0], opp_cards[1])
+            looseness = max(-1.0, min(1.0, (235.0 - strength) / 120.0))
+            self.sd_count += 1
+            self.sd_weak_sum += looseness
 
     def get_stats(self):
         vpip = (self.vpip_hands + 4.0) / (self.hands + 8.0)
         agg = (self.opp_raises + 3.0) / (self.opp_actions + 12.0)
         fold = (self.folded_to_bets + 3.0) / (self.faced_bets + 8.0)
+        sd_loose = self.sd_weak_sum / (self.sd_count + 4.0)
         return (
             max(0.10, min(0.95, vpip)),
             max(0.05, min(0.85, agg)),
             max(0.10, min(0.90, fold)),
+            max(-1.0, min(1.0, sd_loose)),
         )
 
 
 class LiveState:
-    __slots__ = ['hole', 'board', 'dead', 'pot', 'opp_discard']
+    __slots__ = ['hole', 'board', 'dead', 'pot', 'opp_discard', 'is_button']
 
     def __init__(self):
         self.hole = []
@@ -114,6 +149,7 @@ class LiveState:
         self.dead = 0
         self.pot = 0
         self.opp_discard = 0
+        self.is_button = 0
 
 
 def parse_card_id(card_str):
@@ -163,7 +199,7 @@ def choose_discard(req, state, time_left_ms):
     return {"type": "discard", "card": cards[worst_idx]}
 
 
-def choose_action(req, state, tracker, time_left_ms):
+def choose_action(req, state, tracker, time_left_ms, score_cap):
     legal = req.get("legal_actions", [])
 
     if c_lib is None or not state.hole or time_left_ms < 300:
@@ -192,18 +228,20 @@ def choose_action(req, state, tracker, time_left_ms):
     last_raise = max(2, min_raise - opp_bet) if min_raise > opp_bet else max(2, to_call)
     raises_left = 4 if "raise" in legal else 0
 
-    opp_vpip, opp_agg, opp_fold = tracker.get_stats()
+    opp_vpip, opp_agg, opp_fold, opp_sd_loose = tracker.get_stats()
+    eff_stack = min(my_stack, opp_stack + max(0, opp_bet - my_bet))
 
     out_action = ctypes.c_int(0)
     out_amount = ctypes.c_int(0)
 
     c_lib.py_choose_action(
         street_id, 0, raises_left,
-        pot, my_stack, opp_stack, my_bet, opp_bet, last_raise,
+        pot, eff_stack, opp_stack, my_bet, opp_bet, last_raise,
         state.board, state.dead, state.opp_discard,
         hole_ids, len(hole_cards),
         (0.3 if low_time else ACTION_BUDGET_MS),
-        opp_vpip, opp_agg, opp_fold,
+        opp_vpip, opp_agg, opp_fold, opp_sd_loose,
+        state.is_button, tracker.net_chips, score_cap,
         ctypes.byref(out_action), ctypes.byref(out_amount)
     )
 
@@ -222,6 +260,7 @@ def main():
     tracker = OpponentTracker()
     time_bank_ms = 60000.0
     total_spent_ms = 0.0
+    score_cap = 400
 
     for line in sys.stdin:
         line = line.strip()
@@ -240,17 +279,33 @@ def main():
                 current_state.dead = 0
                 current_state.pot = 3
                 current_state.opp_discard = 0
+                seat = msg.get("seat", msg.get("button"))
+                if seat in (0, "SB", "BTN", True):
+                    current_state.is_button = 1
+                elif seat in (1, "BB", False):
+                    current_state.is_button = 0
+                else:
+                    current_state.is_button = 1 if (tracker.hands % 2 == 0) else 0
                 if "time_bank_ms" in msg:
                     time_bank_ms = float(msg["time_bank_ms"])
+                    score_cap = 1000 if time_bank_ms > 100000 else 400
             elif t == "action_request":
                 if "hole_cards" in msg:
                     current_state.hole = list(msg["hole_cards"])
                 current_state.board = 0
                 for c in msg.get("board", []):
                     current_state.board |= (1 << parse_card_id(c))
+                if msg.get("street") == "preflop":
+                    my_b = int(msg.get("my_bet", 0))
+                    opp_b = int(msg.get("opp_bet", 0))
+                    if my_b == 1 and opp_b == 2:
+                        current_state.is_button = 1
+                    elif my_b == 2 and opp_b >= 2:
+                        current_state.is_button = 0
                 reply = choose_action(
                     msg, current_state, tracker,
-                    float(msg.get("time_left_ms", time_bank_ms - total_spent_ms))
+                    float(msg.get("time_left_ms", time_bank_ms - total_spent_ms)),
+                    score_cap
                 )
             elif t == "discard_request":
                 if "hole_cards" in msg:
@@ -275,7 +330,7 @@ def main():
                 elif my_discard:
                     current_state.hole = [c for c in current_state.hole if c != my_discard]
             elif t == "hand_result":
-                tracker.update_from_history(msg.get("history", []))
+                tracker.update_from_result(msg)
                 if tracker.hands % 50 == 0:
                     gc.collect()
             elif t == "match_end":
@@ -295,6 +350,7 @@ def main():
             else:
                 sys.stdout.write(json.dumps({"type": "action", "action": "fold"}) + '\n')
             sys.stdout.flush()
+
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,7 @@ extern "C" {
 void py_init_engine(const char* table_path) {
     (void)table_path;
     init_evaluator_tables();
+    init_solver_tables();
 }
 
 int py_choose_discard(
@@ -36,6 +37,10 @@ void py_choose_action(
     double opp_vpip,
     double opp_agg,
     double opp_fold,
+    double opp_sd_looseness,
+    int is_button,
+    int cumulative_net,
+    int score_cap,
     int* out_action,
     int* out_amount
 ) {
@@ -54,7 +59,8 @@ void py_choose_action(
 
     SolverResult res = solve_best_action(
         s, hole_cards, num_hole_cards, time_budget_ms,
-        opp_vpip, opp_agg, opp_fold, opp_discard
+        opp_vpip, opp_agg, opp_fold, opp_sd_looseness,
+        opp_discard, is_button, cumulative_net, score_cap
     );
     *out_action = res.action;
     *out_amount = res.amount;

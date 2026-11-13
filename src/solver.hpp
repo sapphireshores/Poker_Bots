@@ -8,6 +8,8 @@ struct SolverResult {
     int amount;
 };
 
+void init_solver_tables();
+
 int solve_best_discard(
     const uint8_t hole_cards[3],
     const uint8_t board_cards[3],
@@ -23,5 +25,9 @@ SolverResult solve_best_action(
     double opp_vpip,
     double opp_agg,
     double opp_fold,
-    uint64_t opp_discard
+    double opp_sd_looseness,
+    uint64_t opp_discard,
+    int is_button,
+    int cumulative_net,
+    int score_cap
 );
