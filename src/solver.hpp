@@ -1,13 +1,11 @@
 #pragma once
-#include <cstdint>
-#include "evaluator.hpp"
 #include "state.hpp"
 #include "abstraction.hpp"
-#include "flatmap.hpp"
+#include "evaluator.hpp"
 
 struct SolverResult {
-    int action; // 0 = FOLD, 1 = CALL/CHECK, 2 = RAISE
-    int amount; // total wager amount if RAISE
+    int action;
+    int amount;
 };
 
 int solve_best_discard(
@@ -22,7 +20,8 @@ SolverResult solve_best_action(
     const uint8_t my_hole[3],
     int num_hole_cards,
     double time_budget_ms,
-    double opp_vpip = 0.55,
-    double opp_agg = 0.25,
-    double opp_fold = 0.40
+    double opp_vpip,
+    double opp_agg,
+    double opp_fold,
+    uint64_t opp_discard
 );

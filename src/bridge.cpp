@@ -29,6 +29,7 @@ void py_choose_action(
     uint16_t last_raise_size,
     uint64_t board,
     uint64_t dead,
+    uint64_t opp_discard,
     const uint8_t* hole_cards,
     int num_hole_cards,
     double time_budget_ms,
@@ -53,7 +54,7 @@ void py_choose_action(
 
     SolverResult res = solve_best_action(
         s, hole_cards, num_hole_cards, time_budget_ms,
-        opp_vpip, opp_agg, opp_fold
+        opp_vpip, opp_agg, opp_fold, opp_discard
     );
     *out_action = res.action;
     *out_amount = res.amount;
