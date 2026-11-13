@@ -10,6 +10,17 @@
 #ifndef ITER_CAP_ACTION
 #define ITER_CAP_ACTION 6500
 #endif
+#ifndef PASSIVE_CAP_STRENGTH
+#define PASSIVE_CAP_STRENGTH 600
+#endif
+
+static inline int popcnt64(u64 x) {
+    return __builtin_popcountll(x);
+}
+
+static inline int ctz64(u64 x) {
+    return __builtin_ctzll(x);
+}
 
 struct FastRNG {
     uint64_t s;
@@ -36,7 +47,7 @@ struct FastRNG {
 
 static inline u64 sample_cards(u64& available_mask, int k, FastRNG& rng) {
     u64 chosen = 0;
-    int avail_count = std::popcount(available_mask);
+    int avail_count = popcnt64(available_mask);
     for (int i = 0; i < k && avail_count > 0; ++i) {
         int target = rng.next_int(avail_count);
         u64 temp = available_mask;
@@ -44,7 +55,7 @@ static inline u64 sample_cards(u64& available_mask, int k, FastRNG& rng) {
             temp &= (temp - 1);
             --target;
         }
-        int card_idx = std::countr_zero(temp);
+        int card_idx = ctz64(temp);
         u64 bit = (1ULL << card_idx);
         chosen |= bit;
         available_mask &= ~bit;
@@ -100,7 +111,7 @@ static inline u64 best_two_on_flop(const uint8_t h[3], u64 flop_mask) {
             if (a == -1) a = h[i];
             else b = h[i];
         }
-        int64_t val = (static_cast<int64_t>(eval7(flop_mask | pair_mask)) << 12)
+        int64_t val = (static_cast<int64_t>(eval5(flop_mask | pair_mask)) << 12)
                     + two_card_strength(a, b);
         if (val > best_val) {
             best_val = val;
@@ -114,7 +125,6 @@ static inline u64 best_two_on_flop(const uint8_t h[3], u64 flop_mask) {
     return mask;
 }
 
-// Precomputed 3-card preflop equity lookup table (22,100 combinations -> O(1) preflop lookup)
 static float PREFLOP_3CARD_EQ[52][52][52];
 static bool PREFLOP_TABLE_READY = false;
 
@@ -135,7 +145,7 @@ void init_solver_tables() {
                     uint8_t oh[3];
                     int k = 0;
                     u64 t = opp3;
-                    while (t) { oh[k++] = static_cast<uint8_t>(std::countr_zero(t)); t &= (t - 1); }
+                    while (t) { oh[k++] = static_cast<uint8_t>(ctz64(t)); t &= (t - 1); }
                     u64 opp_kept = best_two_of_three(oh);
                     u64 board = sample_cards(avail, 5, rng);
                     uint32_t ms = eval7(board | my_kept);
@@ -143,8 +153,7 @@ void init_solver_tables() {
                     if (ms > os) wins += 1.0;
                     else if (ms == os) wins += 0.5;
                 }
-                float eq = static_cast<float>(wins / N_INIT);
-                PREFLOP_3CARD_EQ[c0][c1][c2] = eq;
+                PREFLOP_3CARD_EQ[c0][c1][c2] = static_cast<float>(wins / N_INIT);
             }
         }
     }
@@ -188,7 +197,7 @@ int solve_best_discard(
         uint8_t opp_h[3];
         for (int i = 0; i < 3; ++i) {
             u64 c = sample_cards(avail, 1, rng);
-            opp_h[i] = static_cast<uint8_t>(std::countr_zero(c));
+            opp_h[i] = static_cast<uint8_t>(ctz64(c));
         }
         u64 opp_kept = best_two_on_flop(opp_h, board_mask);
         u64 runout = sample_cards(avail, 2, rng);
@@ -218,10 +227,12 @@ SolverResult solve_best_action(
     double time_budget_ms,
     double opp_vpip,
     double opp_agg,
-    double opp_fold,
+    double opp_fold_pre,
+    double opp_fold_post,
     double opp_sd_looseness,
     uint64_t opp_discard,
     int is_button,
+    int opp_raised,
     int cumulative_net,
     int score_cap
 ) {
@@ -233,7 +244,7 @@ SolverResult solve_best_action(
         my_hole_mask |= (1ULL << my_hole[i]);
     }
 
-    int board_count = std::popcount(root_state.board);
+    int board_count = popcnt64(root_state.board);
     int needed_board = std::max(0, 5 - board_count);
     u64 base_dead = root_state.dead | root_state.board | my_hole_mask;
 
@@ -241,13 +252,12 @@ SolverResult solve_best_action(
     double to_call = static_cast<double>(ctx.to_call);
     double bet_fraction = to_call / std::max(2.0, pot - to_call);
 
-    // Incorporate empirical showdown looseness into archetype detection
+    double opp_fold = (board_count == 0) ? opp_fold_pre : opp_fold_post;
     double eff_vpip = std::clamp(opp_vpip + opp_sd_looseness * 0.15, 0.10, 0.95);
     bool is_maniac = (opp_agg > 0.45);
     bool is_overfolder = (opp_fold > 0.55);
     bool is_station = (eff_vpip > 0.70 && opp_fold < 0.30);
 
-    // Score-cap variance modulation: protect lead once safely past cap; push variance when far behind
     double cap_protect = 0.0;
     if (score_cap > 0) {
         if (cumulative_net >= score_cap + 60) cap_protect = 0.035;
@@ -257,7 +267,6 @@ SolverResult solve_best_action(
     FastRNG rng(0xCAFEBABE12345678ULL ^ my_hole_mask ^ root_state.board ^ (root_state.pot * 997ULL));
     double equity = 0.5;
 
-    // O(1) instant preflop equity lookup using the 22,100-hand best-2-of-3 table
     if (board_count == 0 && num_hole_cards == 3 && PREFLOP_TABLE_READY) {
         equity = lookup_preflop_eq(my_hole);
         if (!is_maniac && to_call > 0.0) {
@@ -266,7 +275,6 @@ SolverResult solve_best_action(
         }
         equity = std::clamp(equity, 0.05, 0.95);
     } else {
-        // Postflop Monte Carlo rollout with pot-scaled iteration budget
         u64 cand[3] = {0, 0, 0};
         int ncand = 1;
         if (num_hole_cards == 3) {
@@ -284,10 +292,13 @@ SolverResult solve_best_action(
             else min_opp_preflop_score = std::max(0, 130 - sd_offset);
         }
 
+        bool passive_cap = (board_count >= 4 && opp_raised == 0 && opp_agg >= 0.12);
+        u64 flop_mask = (popcnt64(root_state.flop_board) == 3) ? root_state.flop_board : 0ULL;
+
         int pot_scaled_cap = static_cast<int>(ITER_CAP_ACTION * std::clamp(0.45 + pot / 120.0, 0.45, 1.0));
         double eq_sum[3] = {0.0, 0.0, 0.0};
         int iterations = 0;
-        int opp_d = (opp_discard != 0) ? std::countr_zero(opp_discard) : -1;
+        int opp_d = (opp_discard != 0) ? ctz64(opp_discard) : -1;
 
         while (iterations < pot_scaled_cap) {
             if ((iterations & 127) == 0) {
@@ -304,11 +315,22 @@ SolverResult solve_best_action(
                 u64 kept = 0;
                 if (opp_d >= 0) {
                     kept = sample_cards(temp_avail, 2, rng);
-                    int c1 = std::countr_zero(kept);
-                    int c2 = std::countr_zero(kept & (kept - 1));
-                    int s12 = two_card_strength(c1, c2);
-                    if (s12 < two_card_strength(c1, opp_d) || s12 < two_card_strength(c2, opp_d)) {
-                        if (attempt < 23) continue;
+                    int c1 = ctz64(kept);
+                    int c2 = ctz64(kept & (kept - 1));
+                    if (attempt < 23) {
+                        if (flop_mask != 0ULL) {
+                            auto keep_val = [&](u64 pm, int a, int b) -> int64_t {
+                                return (static_cast<int64_t>(eval5(flop_mask | pm)) << 12)
+                                     + two_card_strength(a, b);
+                            };
+                            int64_t v12 = keep_val(kept, c1, c2);
+                            int64_t v1d = keep_val((1ULL << c1) | (1ULL << opp_d), c1, opp_d);
+                            int64_t v2d = keep_val((1ULL << c2) | (1ULL << opp_d), c2, opp_d);
+                            if (v12 < v1d || v12 < v2d) continue;
+                        } else {
+                            int s12 = two_card_strength(c1, c2);
+                            if (s12 < two_card_strength(c1, opp_d) || s12 < two_card_strength(c2, opp_d)) continue;
+                        }
                     }
                 } else if (num_hole_cards == 3) {
                     u64 three = sample_cards(temp_avail, 3, rng);
@@ -316,7 +338,7 @@ SolverResult solve_best_action(
                     int k = 0;
                     u64 t = three;
                     while (t) {
-                        h3[k++] = static_cast<uint8_t>(std::countr_zero(t));
+                        h3[k++] = static_cast<uint8_t>(ctz64(t));
                         t &= (t - 1);
                     }
                     kept = best_two_on_flop(h3, root_state.board);
@@ -324,13 +346,18 @@ SolverResult solve_best_action(
                     kept = sample_cards(temp_avail, 2, rng);
                 }
 
-                int c1 = std::countr_zero(kept);
-                int c2 = std::countr_zero(kept & (kept - 1));
-                if (two_card_strength(c1, c2) >= min_opp_preflop_score || attempt == 23) {
-                    opp_hole = kept;
-                    avail = temp_avail;
-                    break;
+                int c1 = ctz64(kept);
+                int c2 = ctz64(kept & (kept - 1));
+                int str12 = two_card_strength(c1, c2);
+
+                if (attempt < 23) {
+                    if (str12 < min_opp_preflop_score) continue;
+                    if (passive_cap && str12 >= PASSIVE_CAP_STRENGTH && rng.next_int(100) < 70) continue;
                 }
+
+                opp_hole = kept;
+                avail = temp_avail;
+                break;
             }
 
             u64 runout = sample_cards(avail, needed_board, rng);
@@ -349,13 +376,18 @@ SolverResult solve_best_action(
         equity = (iterations > 0) ? (equity_sum / iterations) : 0.5;
     }
 
+    // Positional equity realization adjustment on flop/turn facing a bet
+    if (to_call > 0.0 && (board_count == 3 || board_count == 4)) {
+        equity += (is_button == 1) ? 0.015 : -0.025;
+        equity = std::clamp(equity, 0.02, 0.98);
+    }
+
     double jitter = (rng.next_double() - 0.5) * 0.22;
 
-    // 1. Facing a bet / raise (to_call > 0) — EV-driven + positional decision
+    // 1. Facing a bet / raise (to_call > 0)
     if (to_call > 0.0) {
         double call_ev = equity * (pot + to_call) - to_call;
 
-        // Positional preflop open-raise from Button (seat == 0, facing BB)
         if (board_count == 0 && is_button == 1 && root_state.bet[0] <= 1 && root_state.bet[1] == 2) {
             double open_thresh = (is_overfolder ? 0.36 : 0.45) + cap_protect;
             if (ctx.can_raise && equity >= open_thresh) {
@@ -368,7 +400,6 @@ SolverResult solve_best_action(
             return {FOLD, 0};
         }
 
-        // Value raise EV comparison
         double raise_thresh = (is_station ? 0.57 : 0.64) + cap_protect;
         if (ctx.can_raise && equity >= raise_thresh) {
             double base_mult = (equity >= 0.78) ? 1.0 : 0.68;
@@ -378,26 +409,26 @@ SolverResult solve_best_action(
             uint16_t raise_to = std::max(ctx.min_raise, std::min(ctx.max_raise, target));
             double added_risk = static_cast<double>(raise_to - root_state.bet[0]);
             double fold_eq = is_station ? 0.05 : opp_fold * 0.75;
-            double raise_ev = fold_eq * pot + (1.0 - fold_eq) * (equity * (pot + added_risk * 2.0) - added_risk);
+            double eq_cont = std::max(0.05, equity - fold_eq * 0.22);
+            double raise_ev = fold_eq * pot + (1.0 - fold_eq) * (eq_cont * (pot + added_risk * 2.0) - added_risk);
             if (raise_ev >= call_ev) {
                 return {RAISE, raise_to};
             }
         }
 
-        // Semi-bluff re-raise against over-folders when EV > 0
         if (ctx.can_raise && is_overfolder && !is_maniac && cap_protect <= 0.0 && equity >= 0.44 && equity < 0.56 && (rng.next_int(100) < 28)) {
             double mult = std::max(0.40, 0.55 + jitter);
             uint16_t target = static_cast<uint16_t>(root_state.bet[1] + pot * mult);
             uint16_t raise_to = std::max(ctx.min_raise, std::min(ctx.max_raise, target));
             double added_risk = static_cast<double>(raise_to - root_state.bet[0]);
             double fold_eq = opp_fold * 0.80;
-            double bluff_ev = fold_eq * pot + (1.0 - fold_eq) * (equity * (pot + added_risk * 2.0) - added_risk);
+            double eq_cont = std::max(0.05, equity - fold_eq * 0.22);
+            double bluff_ev = fold_eq * pot + (1.0 - fold_eq) * (eq_cont * (pot + added_risk * 2.0) - added_risk);
             if (bluff_ev > 0.0) {
                 return {RAISE, raise_to};
             }
         }
 
-        // EV-calibrated call threshold with safety margin for reverse implied odds
         double risk_buffer = pot * (0.04 + 0.07 * std::min(1.5, bet_fraction) + cap_protect);
         if (is_maniac) {
             risk_buffer -= pot * 0.06;
@@ -406,7 +437,6 @@ SolverResult solve_best_action(
         if (opp_agg < 0.12 && bet_fraction > 0.8) {
             risk_buffer += pot * 0.06;
         }
-        // Tighter Big Blind defense vs large preflop raises
         if (board_count == 0 && is_button == 0 && bet_fraction >= 0.75) {
             risk_buffer += pot * 0.03;
         }

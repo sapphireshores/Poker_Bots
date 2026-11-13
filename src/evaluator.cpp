@@ -1,197 +1,208 @@
 #include "evaluator.hpp"
-#include <fstream>
-#include <sstream>
-#include <map>
+#include <algorithm>
+#include <bit>
 
 std::array<std::uint32_t, 8192> FLUSH_TABLE{};
-std::array<std::uint32_t, 50388> NONFLUSH_TABLE{};
+std::array<std::uint32_t, 77520> NONFLUSH7_TABLE{};
+std::array<std::uint32_t, 6188> NONFLUSH5_TABLE{};
 
-static std::array<std::array<std::uint32_t, 8>, 25> nCr{};
+static std::uint32_t NCR[22][8]{};
+static bool TABLES_INIT = false;
 
 static void init_ncr() {
-    for (int n = 0; n < 25; ++n) {
-        nCr[n][0] = 1;
-        for (int k = 1; k <= std::min(n, 7); ++k) {
-            nCr[n][k] = nCr[n - 1][k - 1] + nCr[n - 1][k];
+    for (int n = 0; n < 22; ++n) {
+        NCR[n][0] = 1;
+        for (int k = 1; k < 8 && k <= n; ++k) {
+            NCR[n][k] = NCR[n - 1][k - 1] + NCR[n - 1][k];
         }
     }
 }
 
-std::uint32_t combinadic_index_7(const std::array<int, 7>& r) {
+static inline std::uint32_t combinadic_index_7(const std::uint8_t r[7]) {
     std::uint32_t idx = 0;
     for (int i = 0; i < 7; ++i) {
-        idx += nCr[r[i] + i][i + 1];
+        idx += NCR[r[i] + i][i + 1];
     }
     return idx;
 }
 
-static std::uint32_t eval5_ranks(const std::array<int, 5>& r, bool is_flush) {
-    std::array<int, 5> ranks = r;
-    std::sort(ranks.rbegin(), ranks.rend());
+static inline std::uint32_t combinadic_index_5(const std::uint8_t r[5]) {
+    std::uint32_t idx = 0;
+    for (int i = 0; i < 5; ++i) {
+        idx += NCR[r[i] + i][i + 1];
+    }
+    return idx;
+}
 
-    bool is_straight = false;
-    int straight_high = 0;
+static std::uint32_t eval5_ranks(const std::array<std::uint8_t, 5>& sorted_r, bool is_flush) {
+    int cnt[13]{};
+    for (std::uint8_t r : sorted_r) ++cnt[r];
 
-    if (ranks[0] - ranks[4] == 4 && ranks[0] != ranks[1] && ranks[1] != ranks[2] && ranks[2] != ranks[3] && ranks[3] != ranks[4]) {
-        is_straight = true;
-        straight_high = ranks[0];
-    } else if (ranks[0] == 12 && ranks[1] == 3 && ranks[2] == 2 && ranks[3] == 1 && ranks[4] == 0) {
-        is_straight = true;
-        straight_high = 3;
+    std::uint16_t mask = 0;
+    for (int r = 0; r < 13; ++r) {
+        if (cnt[r]) mask |= (1U << r);
     }
 
-    if (is_straight && is_flush) return (8 << 20) | (straight_high << 16);
-
-    std::array<int, 13> counts{};
-    for (int rank : ranks) counts[rank]++;
-
-    struct Group { int rank; int count; };
-    std::vector<Group> groups;
-    for (int rank = 12; rank >= 0; --rank) {
-        if (counts[rank] > 0) groups.push_back({rank, counts[rank]});
+    int straight_hi = -1;
+    if (std::popcount(mask) == 5) {
+        if (mask == 0x100FU) {
+            straight_hi = 3; // A-2-3-4-5 wheel
+        } else {
+            int lo = std::countr_zero(mask);
+            if ((mask >> lo) == 0x1FU) straight_hi = lo + 4;
+        }
     }
-    std::stable_sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
-        return a.count > b.count;
-    });
 
-    if (groups[0].count == 4) return (7 << 20) | (groups[0].rank << 16) | (groups[1].rank << 12);
-    if (groups[0].count == 3 && groups[1].count == 2) return (6 << 20) | (groups[0].rank << 16) | (groups[1].rank << 12);
-    if (is_flush) return (5 << 20) | (ranks[0] << 16) | (ranks[1] << 12) | (ranks[2] << 8) | (ranks[3] << 4) | ranks[4];
-    if (is_straight) return (4 << 20) | (straight_high << 16);
-    if (groups[0].count == 3) return (3 << 20) | (groups[0].rank << 16) | (groups[1].rank << 12) | (groups[2].rank << 8);
-    if (groups[0].count == 2 && groups[1].count == 2) return (2 << 20) | (groups[0].rank << 16) | (groups[1].rank << 12) | (groups[2].rank << 8);
-    if (groups[0].count == 2) return (1 << 20) | (groups[0].rank << 16) | (groups[1].rank << 12) | (groups[2].rank << 8) | (groups[3].rank << 4);
-    return (0 << 20) | (ranks[0] << 16) | (ranks[1] << 12) | (ranks[2] << 8) | (ranks[3] << 4) | ranks[4];
+    if (is_flush && straight_hi >= 0) {
+        return (8U << 20) | static_cast<std::uint32_t>(straight_hi);
+    }
+
+    int quad = -1, trip = -1, p1 = -1, p2 = -1;
+    std::uint32_t kickers = 0;
+    for (int r = 12; r >= 0; --r) {
+        if (cnt[r] == 4) quad = r;
+        else if (cnt[r] == 3) trip = r;
+        else if (cnt[r] == 2) {
+            if (p1 < 0) p1 = r;
+            else p2 = r;
+        } else if (cnt[r] == 1) {
+            kickers = (kickers << 4) | static_cast<std::uint32_t>(r);
+        }
+    }
+
+    if (quad >= 0) return (7U << 20) | (static_cast<std::uint32_t>(quad) << 4) | kickers;
+    if (trip >= 0 && p1 >= 0) return (6U << 20) | (static_cast<std::uint32_t>(trip) << 4) | static_cast<std::uint32_t>(p1);
+    if (is_flush) return (5U << 20) | kickers;
+    if (straight_hi >= 0) return (4U << 20) | static_cast<std::uint32_t>(straight_hi);
+    if (trip >= 0) return (3U << 20) | (static_cast<std::uint32_t>(trip) << 8) | kickers;
+    if (p1 >= 0 && p2 >= 0) return (2U << 20) | (static_cast<std::uint32_t>(p1) << 8) | (static_cast<std::uint32_t>(p2) << 4) | kickers;
+    if (p1 >= 0) return (1U << 20) | (static_cast<std::uint32_t>(p1) << 12) | kickers;
+    return kickers;
+}
+
+static void init_flush() {
+    for (std::uint16_t m = 0; m < 8192; ++m) {
+        if (std::popcount(m) < 5) continue;
+        std::uint32_t best = 0;
+        std::uint8_t present[13];
+        int n = 0;
+        for (int r = 0; r < 13; ++r) {
+            if (m & (1U << r)) present[n++] = static_cast<std::uint8_t>(r);
+        }
+        for (int a = 0; a < n - 4; ++a)
+            for (int b = a + 1; b < n - 3; ++b)
+                for (int c = b + 1; c < n - 2; ++c)
+                    for (int d = c + 1; d < n - 1; ++d)
+                        for (int e = d + 1; e < n; ++e) {
+                            std::array<std::uint8_t, 5> hand{present[a], present[b], present[c], present[d], present[e]};
+                            best = std::max(best, eval5_ranks(hand, true));
+                        }
+        FLUSH_TABLE[m] = best;
+    }
+}
+
+static void init_nonflush7() {
+    std::array<std::uint8_t, 7> ms{};
+    for (std::uint8_t r0 = 0; r0 < 13; ++r0) {
+        ms[0] = r0;
+        for (std::uint8_t r1 = r0; r1 < 13; ++r1) {
+            ms[1] = r1;
+            for (std::uint8_t r2 = r1; r2 < 13; ++r2) {
+                ms[2] = r2;
+                for (std::uint8_t r3 = r2; r3 < 13; ++r3) {
+                    ms[3] = r3;
+                    for (std::uint8_t r4 = r3; r4 < 13; ++r4) {
+                        ms[4] = r4;
+                        for (std::uint8_t r5 = r4; r5 < 13; ++r5) {
+                            ms[5] = r5;
+                            for (std::uint8_t r6 = r5; r6 < 13; ++r6) {
+                                ms[6] = r6;
+                                if (r0 == r4 || r1 == r5 || r2 == r6) continue; // >4 of same rank impossible
+                                std::uint32_t best = 0;
+                                for (int skip1 = 0; skip1 < 6; ++skip1) {
+                                    for (int skip2 = skip1 + 1; skip2 < 7; ++skip2) {
+                                        std::array<std::uint8_t, 5> h{};
+                                        int idx = 0;
+                                        for (int k = 0; k < 7; ++k) {
+                                            if (k != skip1 && k != skip2) h[idx++] = ms[k];
+                                        }
+                                        best = std::max(best, eval5_ranks(h, false));
+                                    }
+                                }
+                                NONFLUSH7_TABLE[combinadic_index_7(ms.data())] = best;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void init_nonflush5() {
+    std::array<std::uint8_t, 5> ms{};
+    for (std::uint8_t r0 = 0; r0 < 13; ++r0) {
+        ms[0] = r0;
+        for (std::uint8_t r1 = r0; r1 < 13; ++r1) {
+            ms[1] = r1;
+            for (std::uint8_t r2 = r1; r2 < 13; ++r2) {
+                ms[2] = r2;
+                for (std::uint8_t r3 = r2; r3 < 13; ++r3) {
+                    ms[3] = r3;
+                    for (std::uint8_t r4 = r3; r4 < 13; ++r4) {
+                        ms[4] = r4;
+                        if (r0 == r4) continue; // 5 of same rank impossible
+                        NONFLUSH5_TABLE[combinadic_index_5(ms.data())] = eval5_ranks(ms, false);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void init_evaluator_tables() {
+    if (TABLES_INIT) return;
     init_ncr();
-
-    for (int mask = 0; mask < 8192; ++mask) {
-        if (std::popcount((unsigned int)mask) < 5) continue;
-        std::vector<int> ranks;
-        for (int r = 0; r < 13; ++r) {
-            if ((mask >> r) & 1) ranks.push_back(r);
-        }
-
-        std::uint32_t best_score = 0;
-        int n = ranks.size();
-        for (int a = 0; a < n - 4; ++a) {
-            for (int b = a + 1; b < n - 3; ++b) {
-                for (int c = b + 1; c < n - 2; ++c) {
-                    for (int d = c + 1; d < n - 1; ++d) {
-                        for (int e = d + 1; e < n; ++e) {
-                            std::array<int, 5> sub = {ranks[a], ranks[b], ranks[c], ranks[d], ranks[e]};
-                            best_score = std::max(best_score, eval5_ranks(sub, true));
-                        }
-                    }
-                }
-            }
-        }
-        FLUSH_TABLE[mask] = best_score;
-    }
-
-    for (int r0 = 0; r0 < 13; ++r0) {
-    for (int r1 = r0; r1 < 13; ++r1) {
-    for (int r2 = r1; r2 < 13; ++r2) {
-    for (int r3 = r2; r3 < 13; ++r3) {
-    for (int r4 = r3; r4 < 13; ++r4) {
-    for (int r5 = r4; r5 < 13; ++r5) {
-    for (int r6 = r5; r6 < 13; ++r6) {
-        std::array<int, 7> multiset = {r0, r1, r2, r3, r4, r5, r6};
-        std::uint32_t idx = combinadic_index_7(multiset);
-
-        std::uint32_t best_score = 0;
-        for (int a = 0; a < 3; ++a) {
-            for (int b = a + 1; b < 4; ++b) {
-                for (int c = b + 1; c < 5; ++c) {
-                    for (int d = c + 1; d < 6; ++d) {
-                        for (int e = d + 1; e < 7; ++e) {
-                            std::array<int, 5> sub = {multiset[a], multiset[b], multiset[c], multiset[d], multiset[e]};
-                            best_score = std::max(best_score, eval5_ranks(sub, false));
-                        }
-                    }
-                }
-            }
-        }
-        NONFLUSH_TABLE[idx] = best_score;
-    }}}}}}}
+    init_flush();
+    init_nonflush7();
+    init_nonflush5();
+    TABLES_INIT = true;
 }
 
-std::uint32_t eval7(u64 hand_bitboard) {
+std::uint32_t eval7(u64 cards) {
     for (int s = 0; s < 4; ++s) {
-        u64 m = suit_slice(hand_bitboard, s);
-        if (std::popcount(m) >= 5) {
-            return FLUSH_TABLE[m];
+        std::uint16_t slice = static_cast<std::uint16_t>((cards >> (s * 13)) & 0x1FFFULL);
+        if (std::popcount(slice) >= 5) {
+            return FLUSH_TABLE[slice];
         }
     }
-
-    std::array<int, 7> ranks{};
-    int count = 0;
+    std::uint8_t ranks[7];
+    int k = 0;
     for (int r = 0; r < 13; ++r) {
         for (int s = 0; s < 4; ++s) {
-            if ((hand_bitboard >> card_id(r, s)) & 1ULL) {
-                ranks[count++] = r;
+            if (cards & (1ULL << (s * 13 + r))) {
+                ranks[k++] = static_cast<std::uint8_t>(r);
             }
         }
     }
-    return NONFLUSH_TABLE[combinadic_index_7(ranks)];
+    return NONFLUSH7_TABLE[combinadic_index_7(ranks)];
 }
 
-void export_tables_to_python(const std::string& filepath) {
-    std::ofstream out(filepath);
-    out << "# Auto-generated evaluation tables\n";
-    out << "FLUSH_TABLE = [";
-    for (size_t i = 0; i < FLUSH_TABLE.size(); ++i) {
-        out << FLUSH_TABLE[i] << (i + 1 == FLUSH_TABLE.size() ? "" : ",");
-    }
-    out << "]\n\n";
-
-    out << "NONFLUSH_TABLE = [";
-    for (size_t i = 0; i < NONFLUSH_TABLE.size(); ++i) {
-        out << NONFLUSH_TABLE[i] << (i + 1 == NONFLUSH_TABLE.size() ? "" : ",");
-    }
-    out << "]\n";
-    out.close();
-    std::cout << "[Exporter] Successfully dumped tables to " << filepath << std::endl;
-}
-
-u64 apply_suit_permutation(u64 mask, const std::vector<int>& p) {
-    u64 new_mask = 0;
+std::uint32_t eval5(u64 cards) {
     for (int s = 0; s < 4; ++s) {
-        u64 suit_bits = (mask >> (13 * s)) & 0x1FFF;
-        new_mask |= (suit_bits << (13 * p[s]));
+        std::uint16_t slice = static_cast<std::uint16_t>((cards >> (s * 13)) & 0x1FFFULL);
+        if (std::popcount(slice) == 5) {
+            return FLUSH_TABLE[slice];
+        }
     }
-    return new_mask;
-}
-
-u64 get_canonical_mask(u64 mask) {
-    std::vector<int> p = {0, 1, 2, 3};
-    u64 min_mask = ~0ULL;
-    do {
-        min_mask = std::min(min_mask, apply_suit_permutation(mask, p));
-    } while (std::next_permutation(p.begin(), p.end()));
-    return min_mask;
-}
-
-void build_preflop_classes() {
-    std::map<u64, int> canonical_to_id;
-    int next_id = 0;
-    int total_hands = 0;
-
-    for (int i = 0; i < 50; ++i) {
-        for (int j = i + 1; j < 51; ++j) {
-            for (int k = j + 1; k < 52; ++k) {
-                u64 mask = (1ULL << i) | (1ULL << j) | (1ULL << k);
-                u64 canonical = get_canonical_mask(mask);
-                if (canonical_to_id.find(canonical) == canonical_to_id.end()) {
-                    canonical_to_id[canonical] = next_id++;
-                }
-                total_hands++;
+    std::uint8_t ranks[5];
+    int k = 0;
+    for (int r = 0; r < 13; ++r) {
+        for (int s = 0; s < 4; ++s) {
+            if (cards & (1ULL << (s * 13 + r))) {
+                ranks[k++] = static_cast<std::uint8_t>(r);
             }
         }
     }
-
-    std::cout << "[Preflop] Total 3-card combinations generated: " << total_hands << std::endl;
-    std::cout << "[Preflop] Unique canonical classes found: " << canonical_to_id.size() << " (Expected 1755)" << std::endl;
+    return NONFLUSH5_TABLE[combinadic_index_5(ranks)];
 }
