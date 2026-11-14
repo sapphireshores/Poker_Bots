@@ -1,10 +1,14 @@
-import ctypes
 import gc
 import json
-import os
 import sys
 import time
-import py_fallback
+
+try:
+    import py_fallback
+except Exception as _imp_err:
+    sys.stderr.write(f"WARN: py_fallback import failed ({_imp_err}); using built-in heuristic fallback.\n")
+    sys.stderr.flush()
+    py_fallback = None
 
 SUIT_MAP = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
 RANK_MAP = {
@@ -12,47 +16,6 @@ RANK_MAP = {
     '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12
 }
 STREET_MAP = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LIB_PATH = os.path.join(BASE_DIR, "libpoker_solver.so")
-BIN_PATH = os.path.join(BASE_DIR, "tables.bin").encode("utf-8")
-
-ACTION_BUDGET_MS = 8.0
-DISCARD_BUDGET_MS = 10.0
-
-c_lib = None
-if os.path.exists(LIB_PATH):
-    try:
-        _lib = ctypes.CDLL(LIB_PATH)
-        _lib.py_init_engine.argtypes = [ctypes.c_char_p]
-        _lib.py_init_engine.restype = None
-
-        _lib.py_choose_discard.argtypes = [
-            ctypes.POINTER(ctypes.c_uint8),
-            ctypes.POINTER(ctypes.c_uint8),
-            ctypes.c_uint64,
-            ctypes.c_double
-        ]
-        _lib.py_choose_discard.restype = ctypes.c_int
-
-        _lib.py_choose_action.argtypes = [
-            ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8,
-            ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16,
-            ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16,
-            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
-            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
-            ctypes.c_double,
-            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
-        ]
-        _lib.py_choose_action.restype = None
-        _lib.py_init_engine(BIN_PATH)
-        c_lib = _lib
-    except Exception as _load_err:
-        sys.stderr.write(f"WARN: Could not load C++ solver ({_load_err}); using Python fallback.\n")
-        sys.stderr.flush()
-        c_lib = None
 
 
 def _pair_strength(c1, c2):
@@ -73,16 +36,16 @@ def _pair_strength(c1, c2):
 
 def _compute_dynamic_budget_ms(time_left_ms, hands_played, total_hands, pot, street, is_discard=False):
     hands_rem = max(1, total_hands - hands_played)
-    usable_ms = max(400.0, time_left_ms * 0.65)
+    usable_ms = max(400.0, time_left_ms * 0.70)
     per_hand_ms = usable_ms / hands_rem
-    base = per_hand_ms * (0.18 if is_discard else 0.26)
+    base = per_hand_ms * (0.20 if is_discard else 0.32)
     if pot >= 60:
         base *= 1.45
     elif pot >= 24:
         base *= 1.20
     if street in ("turn", "river"):
         base *= 1.15
-    lo, hi = (2.0, 6.0) if is_discard else (2.4, 9.5)
+    lo, hi = (1.8, 5.5) if is_discard else (2.2, 8.5)
     return max(lo, min(hi, base))
 
 
@@ -179,14 +142,13 @@ class OpponentTracker:
 
 
 class LiveState:
-    __slots__ = ['hole', 'board', 'flop_board', 'dead', 'opp_discard', 'is_button', 'opp_raised']
+    __slots__ = ['hole', 'flop_board_ids', 'dead', 'opp_discard_id', 'is_button', 'opp_raised']
 
     def __init__(self):
         self.hole = []
-        self.board = 0
-        self.flop_board = 0
+        self.flop_board_ids = []
         self.dead = 0
-        self.opp_discard = 0
+        self.opp_discard_id = -1
         self.is_button = 0
         self.opp_raised = 0
 
@@ -221,37 +183,80 @@ def legalize_action(req, action_type, amount=0):
     return {"type": "action", "action": "check"}
 
 
+def _fast_heuristic_discard(cards, board_cards):
+    # O(1) deterministic fallback: keep pair/board-hit/flush-draw/high-card
+    branks = {c[0] for c in board_cards}
+    bsuits = [c[1] for c in board_cards]
+    best_drop, best_sc = 0, -999
+    for d in range(len(cards)):
+        kept = [cards[i] for i in range(len(cards)) if i != d]
+        if len(kept) < 2:
+            continue
+        sc = _pair_strength(kept[0], kept[1])
+        for kc in kept:
+            if kc[0] in branks:
+                sc += 180 + RANK_MAP.get(kc[0], 0) * 10
+            if bsuits.count(kc[1]) >= 2:
+                sc += 35
+        if sc > best_sc:
+            best_sc, best_drop = sc, d
+    return cards[best_drop]
+
+
+def _fast_heuristic_action(req, hole):
+    # O(1) deterministic fallback when time_left_ms < 300ms
+    legal = req.get("legal_actions", [])
+    board = req.get("board", [])
+    pot = max(2, int(req.get("pot", 2)))
+    to_call = int(req.get("to_call", 0))
+    branks = {c[0] for c in board}
+    ranks = [RANK_MAP.get(c[0], 0) for c in hole]
+    has_pair = (len(set(ranks)) < len(ranks))
+    hits = sum(1 for c in hole if c[0] in branks)
+    strong = (hits >= 2) or (has_pair and (hits >= 1 or (max(ranks) if ranks else 0) >= 9))
+    playable = strong or hits >= 1 or (max(ranks) if ranks else 0) >= 11
+
+    if to_call <= 0:
+        if strong and "raise" in legal:
+            return legalize_action(req, "raise", int(req.get("opp_bet", 0)) + pot // 2)
+        return legalize_action(req, "check")
+    if strong and to_call <= pot:
+        return legalize_action(req, "call")
+    if playable and to_call <= pot * 0.35:
+        return legalize_action(req, "call")
+    return legalize_action(req, "check" if "check" in legal else "fold")
+
+
 def choose_discard(req, state, time_left_ms, hands_played=0, total_hands=400):
     cards = req.get("hole_cards", state.hole)
     if not cards:
         return {"type": "discard", "card": "2s"}
     board_cards = req.get("board", [])
 
-    if c_lib is not None and len(board_cards) >= 3 and len(cards) >= 3 and time_left_ms > 2000:
-        hole_arr = (ctypes.c_uint8 * 3)(*[parse_card_id(c) for c in cards[:3]])
-        board_arr = (ctypes.c_uint8 * 3)(*[parse_card_id(c) for c in board_cards[:3]])
-        budget = _compute_dynamic_budget_ms(
-            time_left_ms, hands_played, total_hands, int(req.get("pot", 6)), "flop", is_discard=True
-        )
-        drop_idx = int(c_lib.py_choose_discard(hole_arr, board_arr, state.dead, budget))
-        if 0 <= drop_idx < len(cards):
-            return {"type": "discard", "card": cards[drop_idx]}
+    if py_fallback is not None and len(board_cards) >= 3 and len(cards) >= 3 and time_left_ms > 1500:
+        try:
+            h_ids = [parse_card_id(c) for c in cards[:3]]
+            b_ids = [parse_card_id(c) for c in board_cards[:3]]
+            budget = _compute_dynamic_budget_ms(
+                time_left_ms, hands_played, total_hands, int(req.get("pot", 6)), "flop", is_discard=True
+            )
+            drop_idx = py_fallback.py_choose_discard(h_ids, b_ids, state.dead, budget_ms=budget)
+            if 0 <= drop_idx < len(cards):
+                return {"type": "discard", "card": cards[drop_idx]}
+        except Exception as e:
+            sys.stderr.write(f"WARN: discard solver fallback ({e})\n")
+            sys.stderr.flush()
 
-    if len(board_cards) >= 3 and len(cards) >= 3 and time_left_ms > 2500:
-        h_ids = [parse_card_id(c) for c in cards[:3]]
-        b_ids = [parse_card_id(c) for c in board_cards[:3]]
-        drop_idx = py_fallback.py_choose_discard(h_ids, b_ids, state.dead, n_samples=140)
-        if 0 <= drop_idx < len(cards):
-            return {"type": "discard", "card": cards[drop_idx]}
-
-    worst_idx = min(range(len(cards)), key=lambda i: RANK_MAP.get(cards[i][0], 0))
-    return {"type": "discard", "card": cards[worst_idx]}
+    return {"type": "discard", "card": _fast_heuristic_discard(cards, board_cards)}
 
 
 def choose_action(req, state, tracker, time_left_ms, score_cap, total_hands=400):
     legal = req.get("legal_actions", [])
 
-    if c_lib is None and state.hole and time_left_ms >= 600:
+    if py_fallback is None or not state.hole or time_left_ms < 350:
+        return _fast_heuristic_action(req, state.hole)
+
+    try:
         street_name = req.get("street", "preflop")
         street_id = STREET_MAP.get(street_name, 0)
         pot = int(req.get("pot", 2))
@@ -260,72 +265,27 @@ def choose_action(req, state, tracker, time_left_ms, score_cap, total_hands=400)
         to_call = int(req.get("to_call", max(0, opp_bet - my_bet)))
         min_raise = int(req.get("min_raise", 0))
         max_raise = int(req.get("max_raise", 0))
-        _, opp_agg, opp_fold_pre, opp_fold_post, _ = tracker.get_stats()
+
+        opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose = tracker.get_stats()
         h_ids = [parse_card_id(c) for c in state.hole[:3]]
         b_ids = [parse_card_id(c) for c in req.get("board", [])]
-        n_samp = 0 if street_id == 0 else (28 if time_left_ms < 4000 else 72)
+
+        budget = 0.35 if time_left_ms < 1800 else _compute_dynamic_budget_ms(
+            time_left_ms, tracker.hands, total_hands, pot, street_name, is_discard=False
+        )
+
         act, amt = py_fallback.py_choose_action(
             street_id, pot, to_call, my_bet, opp_bet, min_raise, max_raise, legal,
-            h_ids, b_ids, state.dead, opp_fold_pre, opp_fold_post, opp_agg,
-            state.is_button, tracker.net_chips, score_cap, n_samples=n_samp
+            h_ids, b_ids, state.flop_board_ids, state.dead, state.opp_discard_id,
+            opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose,
+            state.is_button, state.opp_raised, tracker.net_chips, score_cap,
+            budget_ms=budget
         )
         return legalize_action(req, act, amt)
-
-    if c_lib is None or not state.hole or time_left_ms < 300:
-        if "check" in legal:
-            return legalize_action(req, "check")
-        pot = max(1, int(req.get("pot", 2)))
-        small = int(req.get("to_call", 0)) <= 0.33 * pot
-        return legalize_action(req, "call" if small else "fold")
-
-    low_time = time_left_ms < 2000
-
-    hole_cards = state.hole
-    hole_ids = (ctypes.c_uint8 * 3)(
-        *[parse_card_id(c) for c in hole_cards[:3]] + [0] * (3 - len(hole_cards[:3]))
-    )
-
-    street_name = req.get("street", "preflop")
-    street_id = STREET_MAP.get(street_name, 0)
-    pot = int(req.get("pot", 2))
-    my_stack = int(req.get("my_stack", 200))
-    opp_stack = int(req.get("opp_stack", 200))
-    my_bet = int(req.get("my_bet", 0))
-    opp_bet = int(req.get("opp_bet", 0))
-    to_call = int(req.get("to_call", max(0, opp_bet - my_bet)))
-
-    min_raise = int(req.get("min_raise", 0))
-    last_raise = max(2, min_raise - opp_bet) if min_raise > opp_bet else max(2, to_call)
-    raises_left = int(req.get("raises_left", 4 if "raise" in legal else 0))
-
-    opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose = tracker.get_stats()
-    eff_stack = min(my_stack, opp_stack + max(0, opp_bet - my_bet))
-
-    budget = 0.3 if low_time else _compute_dynamic_budget_ms(
-        time_left_ms, tracker.hands, total_hands, pot, street_name, is_discard=False
-    )
-
-    out_action = ctypes.c_int(0)
-    out_amount = ctypes.c_int(0)
-
-    c_lib.py_choose_action(
-        street_id, 0, raises_left,
-        pot, eff_stack, opp_stack, my_bet, opp_bet, last_raise,
-        state.board, state.flop_board, state.dead, state.opp_discard,
-        hole_ids, len(hole_cards),
-        budget,
-        opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose,
-        state.is_button, state.opp_raised, tracker.net_chips, score_cap,
-        ctypes.byref(out_action), ctypes.byref(out_amount)
-    )
-
-    act_code = out_action.value
-    if act_code == 2:
-        return legalize_action(req, "raise", out_amount.value)
-    elif act_code == 1:
-        return legalize_action(req, "call" if "call" in legal else "check")
-    else:
-        return legalize_action(req, "check" if "check" in legal else "fold")
+    except Exception as e:
+        sys.stderr.write(f"WARN: action solver fallback ({e})\n")
+        sys.stderr.flush()
+        return _fast_heuristic_action(req, state.hole)
 
 
 def main():
@@ -356,10 +316,9 @@ def main():
                 score_cap = 1000 if (total_hands > 600 or time_bank_ms > 100000) else 400
             elif t == "new_hand":
                 current_state.hole = list(msg.get("hole_cards", []))
-                current_state.board = 0
-                current_state.flop_board = 0
+                current_state.flop_board_ids = []
                 current_state.dead = 0
-                current_state.opp_discard = 0
+                current_state.opp_discard_id = -1
                 current_state.opp_raised = 0
                 seat = msg.get("seat", msg.get("button"))
                 if seat in ("button", "BTN", "SB", 0) and seat is not False:
@@ -377,11 +336,8 @@ def main():
                 if "hole_cards" in msg:
                     current_state.hole = list(msg["hole_cards"])
                 board_cards = msg.get("board", [])
-                current_state.board = 0
-                for c in board_cards:
-                    current_state.board |= (1 << parse_card_id(c))
-                if len(board_cards) == 3 and current_state.flop_board == 0:
-                    current_state.flop_board = current_state.board
+                if len(board_cards) == 3 and not current_state.flop_board_ids:
+                    current_state.flop_board_ids = [parse_card_id(c) for c in board_cards]
 
                 my_b = int(msg.get("my_bet", 0))
                 opp_b = int(msg.get("opp_bet", 0))
@@ -407,11 +363,8 @@ def main():
                 if "hole_cards" in msg:
                     current_state.hole = list(msg["hole_cards"])
                 board_cards = msg.get("board", [])
-                current_state.board = 0
-                for c in board_cards:
-                    current_state.board |= (1 << parse_card_id(c))
-                if len(board_cards) == 3 and current_state.flop_board == 0:
-                    current_state.flop_board = current_state.board
+                if len(board_cards) == 3 and not current_state.flop_board_ids:
+                    current_state.flop_board_ids = [parse_card_id(c) for c in board_cards]
                 reply = choose_discard(
                     msg, current_state,
                     float(msg.get("time_left_ms", time_bank_ms - total_spent_ms)),
@@ -424,8 +377,9 @@ def main():
                 if my_discard:
                     current_state.dead |= (1 << parse_card_id(my_discard))
                 if opp_discard:
-                    current_state.dead |= (1 << parse_card_id(opp_discard))
-                    current_state.opp_discard = (1 << parse_card_id(opp_discard))
+                    od_id = parse_card_id(opp_discard)
+                    current_state.dead |= (1 << od_id)
+                    current_state.opp_discard_id = od_id
                 if "hole_cards" in msg:
                     current_state.hole = list(msg["hole_cards"])
                 elif my_discard:
@@ -449,19 +403,11 @@ def main():
                 mt = msg.get("type")
                 if mt == "discard_request":
                     hc = msg.get("hole_cards", current_state.hole)
-                    fallback_card = min(hc, key=lambda c: RANK_MAP.get(c[0], 0)) if hc else "2s"
-                    sys.stdout.write(json.dumps({"type": "discard", "card": fallback_card}) + '\n')
+                    fb_card = _fast_heuristic_discard(hc, msg.get("board", [])) if hc else "2s"
+                    sys.stdout.write(json.dumps({"type": "discard", "card": fb_card}) + '\n')
                     sys.stdout.flush()
                 elif mt == "action_request":
-                    legal = msg.get("legal_actions", [])
-                    to_call = int(msg.get("to_call", 0))
-                    pot = max(1, int(msg.get("pot", 2)))
-                    if to_call <= 0 and "check" in legal:
-                        fb = legalize_action(msg, "check")
-                    elif "call" in legal and to_call <= pot * 0.35:
-                        fb = legalize_action(msg, "call")
-                    else:
-                        fb = legalize_action(msg, "check" if "check" in legal else "fold")
+                    fb = _fast_heuristic_action(msg, msg.get("hole_cards", current_state.hole))
                     sys.stdout.write(json.dumps(fb) + '\n')
                     sys.stdout.flush()
             elif '"discard_request"' in line:
