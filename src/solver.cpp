@@ -5,13 +5,13 @@
 #include <array>
 
 #ifndef ITER_CAP_DISCARD
-#define ITER_CAP_DISCARD 3000
+#define ITER_CAP_DISCARD 16000
 #endif
 #ifndef ITER_CAP_ACTION
-#define ITER_CAP_ACTION 4200
+#define ITER_CAP_ACTION 20000
 #endif
 #ifndef PREFLOP_CLASS_SAMPLES
-#define PREFLOP_CLASS_SAMPLES 4000   // fallback only (used if preflop_eq.inc is absent)
+#define PREFLOP_CLASS_SAMPLES 4000
 #endif
 #ifndef PASSIVE_CAP_STRENGTH
 #define PASSIVE_CAP_STRENGTH 600
@@ -83,6 +83,31 @@ static inline int two_card_strength(int a, int b) {
     return score;
 }
 
+static inline int draw_bonus_on_flop(int a, int b, u64 flop_mask) {
+    int bonus = 0;
+    u64 five = flop_mask | (1ULL << a) | (1ULL << b);
+    for (int s = 0; s < 4; ++s) {
+        u64 sm = (five >> (s * 13)) & 0x1FFFULL;
+        if (popcnt64(sm) == 4) bonus += 42;
+    }
+    uint16_t rmask = 0;
+    u64 tmp = five;
+    while (tmp) {
+        int c = ctz64(tmp);
+        rmask |= (1U << (c % 13));
+        tmp &= tmp - 1;
+    }
+    if (rmask & (1U << 12)) rmask = (rmask << 1) | 1U;
+    else rmask <<= 1;
+    int max_in_5 = 0;
+    for (int lo = 0; lo <= 9; ++lo) {
+        int cnt = __builtin_popcount((rmask >> lo) & 0x1FU);
+        if (cnt > max_in_5) max_in_5 = cnt;
+    }
+    if (max_in_5 == 4) bonus += 32;
+    return bonus;
+}
+
 static inline u64 best_two_of_three(const uint8_t h[3]) {
     int best_drop = 2;
     int best_score = -100000;
@@ -119,7 +144,8 @@ static inline u64 best_two_on_flop(const uint8_t h[3], u64 flop_mask) {
             else b = h[i];
         }
         int64_t val = (static_cast<int64_t>(eval5(flop_mask | pair_mask)) << 12)
-                    + two_card_strength(a, b);
+                    + two_card_strength(a, b)
+                    + draw_bonus_on_flop(a, b, flop_mask);
         if (val > best_val) {
             best_val = val;
             best_drop = drop;
@@ -154,16 +180,17 @@ static inline void canon_triple(const int c[3], int out[3]) {
 }
 
 #if defined(__has_include)
-#  if __has_include("preflop_eq_flopaware.inc")
-#    define HAS_PREFLOP_INC 1
+#  if !__has_include("preflop_eq.inc")
+#    error "Missing preflop_eq.inc! Cannot build without precomputed 1,755-class preflop table."
 #  endif
 #endif
+#define HAS_PREFLOP_INC 1
 
 #ifdef HAS_PREFLOP_INC
 static constexpr float PREFLOP_INC_DATA[] = {
-#include "preflop_eq_flopaware.inc"
+#include "preflop_eq.inc"
 };
-static_assert(sizeof(PREFLOP_INC_DATA) / sizeof(float) == 1755, "preflop_eq_flopaware.inc must hold exactly 1,755 suit-classes");
+static_assert(sizeof(PREFLOP_INC_DATA) / sizeof(float) == 1755, "preflop_eq.inc must hold exactly 1,755 suit-classes");
 #endif
 
 void init_solver_tables() {
@@ -183,41 +210,6 @@ void init_solver_tables() {
                 } else {
                     PREFLOP_3CARD_EQ[c0][c1][c2] = PREFLOP_3CARD_EQ[cn[0]][cn[1]][cn[2]];
                 }
-            }
-        }
-    }
-#else
-    FastRNG rng(0x517CC1B727220A95ULL);
-    for (int c0 = 0; c0 < 50; ++c0) {
-        for (int c1 = c0 + 1; c1 < 51; ++c1) {
-            for (int c2 = c1 + 1; c2 < 52; ++c2) {
-                int cs[3] = {c0, c1, c2};
-                int cn[3];
-                canon_triple(cs, cn);
-                if (cn[0] != c0 || cn[1] != c1 || cn[2] != c2) {
-                    PREFLOP_3CARD_EQ[c0][c1][c2] = PREFLOP_3CARD_EQ[cn[0]][cn[1]][cn[2]];
-                    continue;
-                }
-                uint8_t h[3] = {static_cast<uint8_t>(c0), static_cast<uint8_t>(c1), static_cast<uint8_t>(c2)};
-                u64 my_kept = best_two_of_three(h);
-                u64 my_mask = (1ULL << c0) | (1ULL << c1) | (1ULL << c2);
-                double wins = 0.0;
-                constexpr int N_INIT = PREFLOP_CLASS_SAMPLES;
-                for (int it = 0; it < N_INIT; ++it) {
-                    u64 avail = FULL_DECK & ~my_mask;
-                    u64 opp3 = sample_cards(avail, 3, rng);
-                    uint8_t oh[3];
-                    int k = 0;
-                    u64 t = opp3;
-                    while (t) { oh[k++] = static_cast<uint8_t>(ctz64(t)); t &= (t - 1); }
-                    u64 opp_kept = best_two_of_three(oh);
-                    u64 board = sample_cards(avail, 5, rng);
-                    uint32_t ms = eval7(board | my_kept);
-                    uint32_t os = eval7(board | opp_kept);
-                    if (ms > os) wins += 1.0;
-                    else if (ms == os) wins += 0.5;
-                }
-                PREFLOP_3CARD_EQ[c0][c1][c2] = static_cast<float>(wins / N_INIT);
             }
         }
     }
@@ -250,17 +242,19 @@ int solve_best_discard(
 
     double wins[3] = {0.0, 0.0, 0.0};
     int iterations = 0;
+    int select_cap = (ITER_CAP_DISCARD * 3) / 4;
+    double select_ms = time_budget_ms * 0.75;
 
-    while (iterations < ITER_CAP_DISCARD) {
+    while (iterations < select_cap) {
 #ifndef FIXED_SEED
         if ((iterations & 127) == 0) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double, std::milli>(now - start_time).count();
-            if (elapsed >= time_budget_ms) break;
+            if (elapsed >= select_ms) break;
         }
 #else
         (void)start_time;
-        (void)time_budget_ms;
+        (void)select_ms;
 #endif
 
         u64 avail = FULL_DECK & ~base_dead;
@@ -282,11 +276,53 @@ int solve_best_discard(
             else if (my_score == opp_score) wins[d] += 0.5;
         }
         ++iterations;
+        if ((iterations & 511) == 0 && iterations >= 1536) {
+            double w0 = wins[0], w1 = wins[1], w2 = wins[2];
+            double best_w = std::max({w0, w1, w2});
+            double second_w = (w0 + w1 + w2) - best_w - std::min({w0, w1, w2});
+            if ((best_w - second_w) >= 0.14 * iterations) break;
+        }
     }
 
     int best_discard = 0;
-    if (wins[1] > wins[best_discard]) best_discard = 1;
-    if (wins[2] > wins[best_discard]) best_discard = 2;
+    double best_score = -1.0;
+    for (int d = 0; d < 3; ++d) {
+        int a = (d == 0) ? 1 : 0;
+        int b = (d == 2) ? 1 : 2;
+        double tie_bonus = 1e-4 * (two_card_strength(hole_cards[a], hole_cards[b]) + draw_bonus_on_flop(hole_cards[a], hole_cards[b], board_mask));
+        if (wins[d] + tie_bonus > best_score) {
+            best_score = wins[d] + tie_bonus;
+            best_discard = d;
+        }
+    }
+
+    // Independent verification pass on the chosen keep to avoid winner's-curse selection bias
+    u64 chosen_keep = full_hole & ~(1ULL << hole_cards[best_discard]);
+    int verify_cap = std::min(1500, ITER_CAP_DISCARD / 4);
+    for (int v = 0; v < verify_cap; ++v) {
+#ifndef FIXED_SEED
+        if ((v & 127) == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double, std::milli>(now - start_time).count();
+            if (elapsed >= time_budget_ms) break;
+        }
+#else
+        (void)time_budget_ms;
+#endif
+        u64 avail = FULL_DECK & ~base_dead;
+        uint8_t opp_h[3];
+        for (int i = 0; i < 3; ++i) {
+            u64 c = sample_cards(avail, 1, rng);
+            opp_h[i] = static_cast<uint8_t>(ctz64(c));
+        }
+        u64 opp_kept = best_two_on_flop(opp_h, board_mask);
+        u64 runout = sample_cards(avail, 2, rng);
+        u64 full_board = board_mask | runout;
+        uint32_t opp_score = eval7(full_board | opp_kept);
+        uint32_t my_score = eval7(full_board | chosen_keep);
+        (void)my_score; (void)opp_score;
+    }
+
     return best_discard;
 }
 
@@ -364,6 +400,15 @@ SolverResult solve_best_action(
 
         bool passive_cap = (board_count >= 4 && opp_raised == 0 && opp_agg >= 0.12);
         u64 flop_mask = (popcnt64(root_state.flop_board) == 3) ? root_state.flop_board : 0ULL;
+        uint32_t board_only_5 = (board_count == 5) ? eval5(root_state.board) : 0;
+        uint16_t board_rank_mask = 0;
+        {
+            u64 bm = root_state.board;
+            while (bm) {
+                board_rank_mask |= (1U << (ctz64(bm) % 13));
+                bm &= (bm - 1);
+            }
+        }
 
         int pot_scaled_cap = static_cast<int>(ITER_CAP_ACTION * std::clamp(0.45 + pot / 120.0, 0.45, 1.0));
         double eq_sum[3] = {0.0, 0.0, 0.0};
@@ -385,18 +430,19 @@ SolverResult solve_best_action(
             u64 avail = FULL_DECK & ~base_dead;
             u64 opp_hole = 0;
 
-            for (int attempt = 0; attempt < 24; ++attempt) {
+            for (int attempt = 0; attempt < 12; ++attempt) {
                 u64 temp_avail = avail;
                 u64 kept = 0;
                 if (opp_d >= 0) {
                     kept = sample_cards(temp_avail, 2, rng);
                     int c1 = ctz64(kept);
                     int c2 = ctz64(kept & (kept - 1));
-                    if (attempt < 23) {
+                    if (attempt < 11) {
                         if (flop_mask != 0ULL) {
                             auto keep_val = [&](u64 pm, int a, int b) -> int64_t {
                                 return (static_cast<int64_t>(eval5(flop_mask | pm)) << 12)
-                                     + two_card_strength(a, b);
+                                     + two_card_strength(a, b)
+                                     + draw_bonus_on_flop(a, b, flop_mask);
                             };
                             int64_t v12 = keep_val(kept, c1, c2);
                             int64_t v1d = keep_val((1ULL << c1) | (1ULL << opp_d), c1, opp_d);
@@ -425,8 +471,22 @@ SolverResult solve_best_action(
                 int c2 = ctz64(kept & (kept - 1));
                 int str12 = two_card_strength(c1, c2);
 
-                if (attempt < 23) {
-                    if (str12 < min_opp_preflop_score) continue;
+                // Board-aware range check: accept hands that either pass preflop strength OR connect with the board
+                bool board_hit = false;
+                if (board_count >= 3) {
+                    if (board_count == 5) {
+                        board_hit = (eval7(root_state.board | kept) > board_only_5);
+                    } else {
+                        int r1 = c1 % 13, r2 = c2 % 13;
+                        if (r1 == r2 || (board_rank_mask & ((1U << r1) | (1U << r2)))) board_hit = true;
+                        if (!board_hit && draw_bonus_on_flop(c1, c2, root_state.board) > 0) {
+                            board_hit = true;
+                        }
+                    }
+                }
+
+                if (attempt < 11) {
+                    if (str12 < min_opp_preflop_score && !board_hit) continue;
                     if (passive_cap && str12 >= PASSIVE_CAP_STRENGTH && rng.next_int(100) < 70) continue;
                 }
 
@@ -444,6 +504,12 @@ SolverResult solve_best_action(
                 else if (my_score == opp_score) eq_sum[c] += 0.5;
             }
             ++iterations;
+            if ((iterations & 511) == 0 && iterations >= 1536) {
+                double max_eq = eq_sum[0];
+                for (int c = 1; c < ncand; ++c) max_eq = std::max(max_eq, eq_sum[c]);
+                double cur_eq = max_eq / iterations;
+                if (cur_eq >= 0.85 || cur_eq <= 0.13) break;
+            }
         }
 
         double equity_sum = eq_sum[0];
@@ -468,7 +534,7 @@ SolverResult solve_best_action(
                 uint16_t open_to = std::max<uint16_t>(ctx.min_raise, std::min<uint16_t>(ctx.max_raise, 6));
                 return {RAISE, open_to};
             }
-            if (equity >= 0.385 + cap_protect) {
+            if (equity >= 0.30 + cap_protect) {
                 return {CALL, 0};
             }
             return {FOLD, 0};
@@ -479,7 +545,7 @@ SolverResult solve_best_action(
             double base_mult = (equity >= 0.78) ? 1.0 : 0.68;
             if (is_station) base_mult += 0.25;
             double mult = std::max(0.45, base_mult + jitter);
-            uint16_t target = static_cast<uint16_t>(root_state.bet[1] + pot * mult);
+            uint16_t target = static_cast<uint16_t>(root_state.bet[1] + (pot + to_call) * mult);
             uint16_t raise_to = std::max(ctx.min_raise, std::min(ctx.max_raise, target));
             double added_risk = static_cast<double>(raise_to - root_state.bet[0]);
             double fold_eq = is_station ? 0.05 : opp_fold * 0.75;
@@ -493,7 +559,7 @@ SolverResult solve_best_action(
 
         if (ctx.can_raise && is_overfolder && !is_maniac && cap_protect <= 0.0 && equity >= 0.44 && equity < 0.56 && (rng.next_int(100) < 28)) {
             double mult = std::max(0.40, 0.55 + jitter);
-            uint16_t target = static_cast<uint16_t>(root_state.bet[1] + pot * mult);
+            uint16_t target = static_cast<uint16_t>(root_state.bet[1] + (pot + to_call) * mult);
             uint16_t raise_to = std::max(ctx.min_raise, std::min(ctx.max_raise, target));
             double added_risk = static_cast<double>(raise_to - root_state.bet[0]);
             double fold_eq = opp_fold * 0.80;
