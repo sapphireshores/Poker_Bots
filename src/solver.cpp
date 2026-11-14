@@ -5,10 +5,10 @@
 #include <array>
 
 #ifndef ITER_CAP_DISCARD
-#define ITER_CAP_DISCARD 4500
+#define ITER_CAP_DISCARD 3000
 #endif
 #ifndef ITER_CAP_ACTION
-#define ITER_CAP_ACTION 6500
+#define ITER_CAP_ACTION 4200
 #endif
 #ifndef PREFLOP_CLASS_SAMPLES
 #define PREFLOP_CLASS_SAMPLES 4000   // fallback only (used if preflop_eq.inc is absent)
@@ -154,16 +154,16 @@ static inline void canon_triple(const int c[3], int out[3]) {
 }
 
 #if defined(__has_include)
-#  if __has_include("preflop_eq.inc")
+#  if __has_include("preflop_eq_flopaware.inc")
 #    define HAS_PREFLOP_INC 1
 #  endif
 #endif
 
 #ifdef HAS_PREFLOP_INC
 static constexpr float PREFLOP_INC_DATA[] = {
-#include "preflop_eq.inc"
+#include "preflop_eq_flopaware.inc"
 };
-static_assert(sizeof(PREFLOP_INC_DATA) / sizeof(float) == 1755, "preflop_eq.inc must hold exactly 1,755 suit-classes");
+static_assert(sizeof(PREFLOP_INC_DATA) / sizeof(float) == 1755, "preflop_eq_flopaware.inc must hold exactly 1,755 suit-classes");
 #endif
 
 void init_solver_tables() {
@@ -340,8 +340,8 @@ SolverResult solve_best_action(
     if (board_count == 0 && num_hole_cards == 3 && PREFLOP_TABLE_READY) {
         equity = lookup_preflop_eq(my_hole);
         if (!is_maniac && to_call > 0.0) {
-            if (bet_fraction >= 0.75) equity -= 0.045;
-            else if (bet_fraction >= 0.35) equity -= 0.025;
+            if (bet_fraction >= 0.75) equity -= 0.035;
+            else if (bet_fraction >= 0.35) equity -= 0.020;
         }
         equity = std::clamp(equity, 0.05, 0.95);
     } else {
@@ -463,12 +463,12 @@ SolverResult solve_best_action(
         double call_ev = equity * (pot + to_call) - to_call;
 
         if (board_count == 0 && is_button == 1 && root_state.bet[0] <= 1 && root_state.bet[1] == 2) {
-            double open_thresh = (is_overfolder ? 0.36 : 0.45) + cap_protect;
+            double open_thresh = (is_overfolder ? 0.365 : 0.435) + cap_protect;
             if (ctx.can_raise && equity >= open_thresh) {
                 uint16_t open_to = std::max<uint16_t>(ctx.min_raise, std::min<uint16_t>(ctx.max_raise, 6));
                 return {RAISE, open_to};
             }
-            if (equity >= 0.37 + cap_protect) {
+            if (equity >= 0.385 + cap_protect) {
                 return {CALL, 0};
             }
             return {FOLD, 0};
