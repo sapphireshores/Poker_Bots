@@ -10,6 +10,9 @@ except Exception as _imp_err:
     sys.stderr.flush()
     py_fallback = None
 
+LOCK_IN = True
+USE_MIRROR = True
+
 SUIT_MAP = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
 RANK_MAP = {
     '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6,
@@ -19,8 +22,9 @@ STREET_MAP = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3}
 
 
 def _pair_strength(c1, c2):
-    r1, s1 = RANK_MAP[c1[0]], SUIT_MAP[c1[1]]
-    r2, s2 = RANK_MAP[c2[0]], SUIT_MAP[c2[1]]
+    id1, id2 = parse_card_id(c1), parse_card_id(c2)
+    r1, s1 = id1 % 13, id1 // 13
+    r2, s2 = id2 % 13, id2 // 13
     hi, lo = max(r1, r2), min(r1, r2)
     score = hi * 20 + lo * 10
     if r1 == r2:
@@ -32,6 +36,14 @@ def _pair_strength(c1, c2):
     elif hi - lo == 2:
         score += 10
     return score
+
+
+def _is_locked_in(net_chips, score_cap, hands_played, total_hands):
+    if not LOCK_IN or score_cap <= 0:
+        return False
+    hands_rem = max(0, total_hands - hands_played)
+    max_possible_loss = hands_rem * 2
+    return (net_chips - max_possible_loss) >= (score_cap + 10)
 
 
 def _compute_dynamic_budget_ms(time_left_ms, hands_played, total_hands, pot, street, is_discard=False):
@@ -142,7 +154,10 @@ class OpponentTracker:
 
 
 class LiveState:
-    __slots__ = ['hole', 'flop_board_ids', 'dead', 'opp_discard_id', 'is_button', 'opp_raised']
+    __slots__ = [
+        'hole', 'flop_board_ids', 'dead', 'opp_discard_id', 'is_button', 'opp_raised',
+        'opp_known3', 'preview_flop', 'preview_board'
+    ]
 
     def __init__(self):
         self.hole = []
@@ -151,10 +166,16 @@ class LiveState:
         self.opp_discard_id = -1
         self.is_button = 0
         self.opp_raised = 0
+        self.opp_known3 = None
+        self.preview_flop = None
+        self.preview_board = None
 
 
 def parse_card_id(card_str):
-    return SUIT_MAP[card_str[1]] * 13 + RANK_MAP[card_str[0]]
+    s = card_str.strip()
+    if len(s) == 3 and s[:2] == "10":
+        s = "T" + s[2]
+    return SUIT_MAP[s[1].lower()] * 13 + RANK_MAP[s[0].upper()]
 
 
 def legalize_action(req, action_type, amount=0):
@@ -184,9 +205,8 @@ def legalize_action(req, action_type, amount=0):
 
 
 def _fast_heuristic_discard(cards, board_cards):
-    # O(1) deterministic fallback: keep pair/board-hit/flush-draw/high-card
-    branks = {c[0] for c in board_cards}
-    bsuits = [c[1] for c in board_cards]
+    branks = {parse_card_id(c) % 13 for c in board_cards}
+    bsuits = [parse_card_id(c) // 13 for c in board_cards]
     best_drop, best_sc = 0, -999
     for d in range(len(cards)):
         kept = [cards[i] for i in range(len(cards)) if i != d]
@@ -194,9 +214,10 @@ def _fast_heuristic_discard(cards, board_cards):
             continue
         sc = _pair_strength(kept[0], kept[1])
         for kc in kept:
-            if kc[0] in branks:
-                sc += 180 + RANK_MAP.get(kc[0], 0) * 10
-            if bsuits.count(kc[1]) >= 2:
+            kid = parse_card_id(kc)
+            if (kid % 13) in branks:
+                sc += 180 + (kid % 13) * 10
+            if bsuits.count(kid // 13) >= 2:
                 sc += 35
         if sc > best_sc:
             best_sc, best_drop = sc, d
@@ -204,15 +225,14 @@ def _fast_heuristic_discard(cards, board_cards):
 
 
 def _fast_heuristic_action(req, hole):
-    # O(1) deterministic fallback when time_left_ms < 300ms
     legal = req.get("legal_actions", [])
     board = req.get("board", [])
     pot = max(2, int(req.get("pot", 2)))
     to_call = int(req.get("to_call", 0))
-    branks = {c[0] for c in board}
-    ranks = [RANK_MAP.get(c[0], 0) for c in hole]
+    branks = {parse_card_id(c) % 13 for c in board}
+    ranks = [parse_card_id(c) % 13 for c in hole]
     has_pair = (len(set(ranks)) < len(ranks))
-    hits = sum(1 for c in hole if c[0] in branks)
+    hits = sum(1 for r in ranks if r in branks)
     strong = (hits >= 2) or (has_pair and (hits >= 1 or (max(ranks) if ranks else 0) >= 9))
     playable = strong or hits >= 1 or (max(ranks) if ranks else 0) >= 11
 
@@ -227,11 +247,14 @@ def _fast_heuristic_action(req, hole):
     return legalize_action(req, "check" if "check" in legal else "fold")
 
 
-def choose_discard(req, state, time_left_ms, hands_played=0, total_hands=400):
+def choose_discard(req, state, time_left_ms, hands_played=0, total_hands=400, net_chips=0, score_cap=400):
     cards = req.get("hole_cards", state.hole)
     if not cards:
         return {"type": "discard", "card": "2s"}
     board_cards = req.get("board", [])
+
+    if _is_locked_in(net_chips, score_cap, hands_played, total_hands):
+        return {"type": "discard", "card": _fast_heuristic_discard(cards, board_cards)}
 
     if py_fallback is not None and len(board_cards) >= 3 and len(cards) >= 3 and time_left_ms > 1500:
         try:
@@ -240,7 +263,12 @@ def choose_discard(req, state, time_left_ms, hands_played=0, total_hands=400):
             budget = _compute_dynamic_budget_ms(
                 time_left_ms, hands_played, total_hands, int(req.get("pot", 6)), "flop", is_discard=True
             )
-            drop_idx = py_fallback.py_choose_discard(h_ids, b_ids, state.dead, budget_ms=budget)
+            opp3 = state.opp_known3 if USE_MIRROR else None
+            pboard = state.preview_board if USE_MIRROR else None
+            drop_idx = py_fallback.py_choose_discard(
+                h_ids, b_ids, state.dead,
+                opp_known3_ids=opp3, preview_board_ids=pboard, budget_ms=budget
+            )
             if 0 <= drop_idx < len(cards):
                 return {"type": "discard", "card": cards[drop_idx]}
         except Exception as e:
@@ -252,6 +280,9 @@ def choose_discard(req, state, time_left_ms, hands_played=0, total_hands=400):
 
 def choose_action(req, state, tracker, time_left_ms, score_cap, total_hands=400):
     legal = req.get("legal_actions", [])
+
+    if _is_locked_in(tracker.net_chips, score_cap, tracker.hands, total_hands):
+        return legalize_action(req, "check" if "check" in legal else "fold")
 
     if py_fallback is None or not state.hole or time_left_ms < 350:
         return _fast_heuristic_action(req, state.hole)
@@ -274,11 +305,16 @@ def choose_action(req, state, tracker, time_left_ms, score_cap, total_hands=400)
             time_left_ms, tracker.hands, total_hands, pot, street_name, is_discard=False
         )
 
+        opp3 = state.opp_known3 if USE_MIRROR else None
+        pflop = state.preview_flop if USE_MIRROR else None
+        pboard = state.preview_board if USE_MIRROR else None
+
         act, amt = py_fallback.py_choose_action(
             street_id, pot, to_call, my_bet, opp_bet, min_raise, max_raise, legal,
             h_ids, b_ids, state.flop_board_ids, state.dead, state.opp_discard_id,
             opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose,
             state.is_button, state.opp_raised, tracker.net_chips, score_cap,
+            opp_known3_ids=opp3, preview_flop_ids=pflop, preview_board_ids=pboard,
             budget_ms=budget
         )
         return legalize_action(req, act, amt)
@@ -306,20 +342,40 @@ def main():
         msg = None
         try:
             msg = json.loads(line)
+            if not isinstance(msg, dict):
+                continue
             t = msg.get("type")
             reply = None
 
             if t == "init":
+                current_state = LiveState()
+                tracker = OpponentTracker()
+                total_spent_ms = 0.0
                 if "time_bank_ms" in msg:
                     time_bank_ms = float(msg["time_bank_ms"])
                 total_hands = int(msg.get("total_hands", 1000 if time_bank_ms > 100000 else 400))
                 score_cap = 1000 if (total_hands > 600 or time_bank_ms > 100000) else 400
+                if py_fallback is not None:
+                    py_fallback._ensure_preflop_lut()
             elif t == "new_hand":
                 current_state.hole = list(msg.get("hole_cards", []))
                 current_state.flop_board_ids = []
                 current_state.dead = 0
                 current_state.opp_discard_id = -1
                 current_state.opp_raised = 0
+                current_state.opp_known3 = None
+                current_state.preview_flop = None
+                current_state.preview_board = None
+                if USE_MIRROR:
+                    oh = msg.get("opp_hole_cards")
+                    if isinstance(oh, list) and len(oh) >= 3:
+                        current_state.opp_known3 = [parse_card_id(c) for c in oh[:3]]
+                    pf = msg.get("preview_flop")
+                    if isinstance(pf, list) and len(pf) >= 3:
+                        current_state.preview_flop = [parse_card_id(c) for c in pf[:3]]
+                    pb = msg.get("preview_board")
+                    if isinstance(pb, list) and len(pb) >= 5:
+                        current_state.preview_board = [parse_card_id(c) for c in pb[:5]]
                 seat = msg.get("seat", msg.get("button"))
                 if seat in ("button", "BTN", "SB", 0) and seat is not False:
                     current_state.is_button = 1
@@ -369,7 +425,9 @@ def main():
                     msg, current_state,
                     float(msg.get("time_left_ms", time_bank_ms - total_spent_ms)),
                     tracker.hands,
-                    total_hands
+                    total_hands,
+                    tracker.net_chips,
+                    score_cap
                 )
             elif t == "discard_result":
                 my_discard = msg.get("my_discard")

@@ -225,25 +225,160 @@ def _flop_keep_val(b0, b1, b2, a, b):
     return (s5 << 12) + two_s
 
 
-def _has_board_draw(board_ids, a, b):
-    sc = [0, 0, 0, 0]
-    rmask = 0
-    for c in board_ids:
-        sc[c // 13] += 1
-        rmask |= (1 << (c % 13))
-    sc[a // 13] += 1
-    sc[b // 13] += 1
-    if max(sc) >= 4:
-        return True
-    rmask |= (1 << (a % 13)) | (1 << (b % 13))
-    rmask = ((rmask << 1) | 1) if (rmask & (1 << 12)) else (rmask << 1)
-    for lo_r in range(10):
-        if ((rmask >> lo_r) & 0x1F).bit_count() >= 4:
-            return True
-    return False
+def _known_keep_opts(opp3_ids, b0, b1, b2):
+    o0, o1, o2 = opp3_ids[0], opp3_ids[1], opp3_ids[2]
+    v01 = _flop_keep_val(b0, b1, b2, o0, o1)
+    v02 = _flop_keep_val(b0, b1, b2, o0, o2)
+    v12 = _flop_keep_val(b0, b1, b2, o1, o2)
+    if v01 >= v02 and v01 >= v12:
+        return [((o0, o1), 0.70), ((o0, o2), 0.15), ((o1, o2), 0.15)]
+    if v02 >= v12:
+        return [((o0, o2), 0.70), ((o0, o1), 0.15), ((o1, o2), 0.15)]
+    return [((o1, o2), 0.70), ((o0, o1), 0.15), ((o0, o2), 0.15)]
 
 
-def py_choose_discard(hole_ids, board_ids, dead_mask, budget_ms=4.5):
+def _pair_range_weight(a, b, opp_d, has_flop, fb0, fb1, fb2, min_opp_str, passive_cap):
+    if opp_d >= 0:
+        if has_flop:
+            v12 = _flop_keep_val(fb0, fb1, fb2, a, b)
+            if v12 < _flop_keep_val(fb0, fb1, fb2, a, opp_d) or v12 < _flop_keep_val(fb0, fb1, fb2, b, opp_d):
+                return 0.0
+        else:
+            s12 = _PAIR_STR[a][b]
+            if s12 < _PAIR_STR[a][opp_d] or s12 < _PAIR_STR[b][opp_d]:
+                return 0.0
+    s12 = _PAIR_STR[a][b]
+    w = 1.0 if s12 >= min_opp_str else 0.02
+    if passive_cap and s12 >= 600:
+        w *= 0.30
+    return w
+
+
+def _exact_river_equity(board_ids, m0, m1, avail, opp_d, has_flop, fb0, fb1, fb2, min_opp_str, passive_cap):
+    b0, b1, b2, b3, b4 = board_ids[0], board_ids[1], board_ids[2], board_ids[3], board_ids[4]
+    bs = [0, 0, 0, 0]
+    for bc in (b0, b1, b2, b3, b4):
+        bs[bc // 13] |= 1 << (bc % 13)
+    bs0, bs1, bs2, bs3 = bs[0], bs[1], bs[2], bs[3]
+    straight_hi = _STRAIGHT_HI
+    top5_val = _TOP5_VAL
+
+    def eval_with_board(c5, c6):
+        s0, s1, s2, s3 = bs0, bs1, bs2, bs3
+        b5, st5 = 1 << (c5 % 13), c5 // 13
+        if st5 == 0: s0 |= b5
+        elif st5 == 1: s1 |= b5
+        elif st5 == 2: s2 |= b5
+        else: s3 |= b5
+        b6, st6 = 1 << (c6 % 13), c6 // 13
+        if st6 == 0: s0 |= b6
+        elif st6 == 1: s1 |= b6
+        elif st6 == 2: s2 |= b6
+        else: s3 |= b6
+
+        all_r = s0 | s1 | s2 | s3
+        fl = s0 if s0.bit_count() >= 5 else (s1 if s1.bit_count() >= 5 else (s2 if s2.bit_count() >= 5 else (s3 if s3.bit_count() >= 5 else 0)))
+        if fl:
+            sf = straight_hi[fl]
+            if sf >= 0:
+                return (8 << 20) | sf
+        pairs = (s0 & s1) | (s0 & s2) | (s0 & s3) | (s1 & s2) | (s1 & s3) | (s2 & s3)
+        trips = (s0 & s1 & s2) | (s0 & s1 & s3) | (s0 & s2 & s3) | (s1 & s2 & s3)
+        quads = s0 & s1 & s2 & s3
+        if quads:
+            qr = quads.bit_length() - 1
+            return (7 << 20) | (qr << 4) | ((all_r ^ quads).bit_length() - 1)
+        if trips:
+            tr = trips.bit_length() - 1
+            rem_p = pairs ^ (1 << tr)
+            if rem_p:
+                return (6 << 20) | (tr << 4) | (rem_p.bit_length() - 1)
+        if fl:
+            return (5 << 20) | top5_val[fl]
+        st_h = straight_hi[all_r]
+        if st_h >= 0:
+            return (4 << 20) | st_h
+        if trips:
+            tr = trips.bit_length() - 1
+            singles = all_r ^ trips
+            k1 = singles.bit_length() - 1
+            return (3 << 20) | (tr << 8) | (k1 << 4) | ((singles ^ (1 << k1)).bit_length() - 1)
+        if pairs:
+            p1 = pairs.bit_length() - 1
+            rem_p = pairs ^ (1 << p1)
+            if rem_p:
+                p2 = rem_p.bit_length() - 1
+                return (2 << 20) | (p1 << 8) | (p2 << 4) | ((all_r ^ (1 << p1) ^ (1 << p2)).bit_length() - 1)
+            singles = all_r ^ (1 << p1)
+            k1 = singles.bit_length() - 1
+            s2_m = singles ^ (1 << k1)
+            k2 = s2_m.bit_length() - 1
+            return (1 << 20) | (p1 << 12) | (k1 << 8) | (k2 << 4) | ((s2_m ^ (1 << k2)).bit_length() - 1)
+        return top5_val[all_r]
+
+    my_sc = eval_with_board(m0, m1)
+    acc = wsum = u_acc = 0.0
+    u_cnt = 0
+    nu = len(avail)
+    for i in range(nu - 1):
+        a = avail[i]
+        for j in range(i + 1, nu):
+            b = avail[j]
+            opp_sc = eval_with_board(a, b)
+            res = 1.0 if my_sc > opp_sc else (0.5 if my_sc == opp_sc else 0.0)
+            u_acc += res
+            u_cnt += 1
+            w = _pair_range_weight(a, b, opp_d, has_flop, fb0, fb1, fb2, min_opp_str, passive_cap)
+            if w > 0.0:
+                acc += w * res
+                wsum += w
+    if wsum > 1e-12:
+        return acc / wsum
+    return (u_acc / u_cnt) if u_cnt > 0 else 0.5
+
+
+def _exact_turn_equity(board_ids, m0, m1, avail, opp_d, has_flop, fb0, fb1, fb2, min_opp_str, passive_cap, t_end):
+    b0, b1, b2, b3 = board_ids[0], board_ids[1], board_ids[2], board_ids[3]
+    eval7 = _eval7_fast
+    nu = len(avail)
+    pair_w = [[0.0] * nu for _ in range(nu)]
+    for i in range(nu - 1):
+        a = avail[i]
+        for j in range(i + 1, nu):
+            b = avail[j]
+            pair_w[i][j] = _pair_range_weight(a, b, opp_d, has_flop, fb0, fb1, fb2, min_opp_str, passive_cap)
+
+    acc = wsum = u_acc = 0.0
+    u_cnt = 0
+    r_order = list(range(nu))
+    random.shuffle(r_order)
+    for step, r_idx in enumerate(r_order[:10]):
+        if step >= 1 and time.perf_counter() >= t_end:
+            break
+        rc = avail[r_idx]
+        my_sc = eval7(b0, b1, b2, b3, rc, m0, m1)
+        for i in range(nu - 1):
+            if i == r_idx:
+                continue
+            a = avail[i]
+            pw_i = pair_w[i]
+            for j in range(i + 1, nu):
+                if j == r_idx:
+                    continue
+                opp_sc = eval7(b0, b1, b2, b3, rc, a, avail[j])
+                res = 1.0 if my_sc > opp_sc else (0.5 if my_sc == opp_sc else 0.0)
+                u_acc += res
+                u_cnt += 1
+                w = pw_i[j]
+                if w > 0.0:
+                    acc += w * res
+                    wsum += w
+    if wsum > 1e-12:
+        return acc / wsum
+    return (u_acc / u_cnt) if u_cnt > 0 else 0.5
+
+
+def py_choose_discard(hole_ids, board_ids, dead_mask, opp_known3_ids=None, preview_board_ids=None, budget_ms=3.5):
     t_end = time.perf_counter() + (budget_ms * 0.001)
     b0, b1, b2 = board_ids[0], board_ids[1], board_ids[2]
     h0, h1, h2 = hole_ids[0], hole_ids[1], hole_ids[2]
@@ -252,20 +387,52 @@ def py_choose_discard(hole_ids, board_ids, dead_mask, budget_ms=4.5):
     for c in range(52):
         if (dead_mask >> c) & 1:
             used.add(c)
-    avail = [c for c in range(52) if c not in used]
 
+    known = False
+    kopts = None
+    extras = []
+    if opp_known3_ids and len(opp_known3_ids) == 3 and len(set(opp_known3_ids)) == 3:
+        if not any(c in used for c in opp_known3_ids):
+            known = True
+            kopts = _known_keep_opts(opp_known3_ids, b0, b1, b2)
+            used.update(opp_known3_ids)
+            if preview_board_ids:
+                cand_ex = [c for c in preview_board_ids if c not in (b0, b1, b2)]
+                if len(cand_ex) <= 2 and not any(c in used for c in cand_ex):
+                    extras = cand_ex
+                    used.update(extras)
+
+    avail = [c for c in range(52) if c not in used]
     wins = [0.0, 0.0, 0.0]
     rng = random.Random()
     sample_fn = rng.sample
     eval7 = _eval7_fast
     keep_val = _flop_keep_val
     pairs = ((h1, h2), (h0, h2), (h0, h1))
+    deterministic = (known and len(extras) == 2)
 
-    # Stage 1: Selection pass (75% of budget, up to 320 rollouts)
     iters = 0
-    while iters < 180:
+    while iters < 240:
+        if deterministic and iters >= 1:
+            break
         if (iters & 31) == 31 and time.perf_counter() >= t_end:
             break
+
+        if known:
+            need = 2 - len(extras)
+            runout = extras + (sample_fn(avail, need) if need > 0 else [])
+            r3, r4 = runout[0], runout[1]
+            opp_sc = [eval7(b0, b1, b2, r3, r4, ko[0], ko[1]) for ko, _ in kopts]
+            for d in range(3):
+                my_sc = eval7(b0, b1, b2, r3, r4, pairs[d][0], pairs[d][1])
+                for j, (_, w) in enumerate(kopts):
+                    if my_sc > opp_sc[j]:
+                        wins[d] += w
+                    elif my_sc == opp_sc[j]:
+                        wins[d] += 0.5 * w
+            iters += 1
+            continue
+
         o0, o1, o2, r3, r4 = sample_fn(avail, 5)
         v01 = keep_val(b0, b1, b2, o0, o1)
         v02 = keep_val(b0, b1, b2, o0, o2)
@@ -289,7 +456,7 @@ def py_choose_discard(hole_ids, board_ids, dead_mask, budget_ms=4.5):
     best_d = 0
     best_sc = -1.0
     for d in range(3):
-        tie_b = 1e-5 * keep_val(b0, b1, b2, pairs[d][0], pairs[d][1])
+        tie_b = 1e-4 * max(1, iters) * (_PAIR_STR[pairs[d][0]][pairs[d][1]] / 1000.0)
         if wins[d] + tie_b > best_sc:
             best_sc = wins[d] + tie_b
             best_d = d
@@ -300,7 +467,8 @@ def py_choose_action(
     street_id, pot, to_call, my_bet, opp_bet, min_raise, max_raise, legal,
     hole_ids, board_ids, flop_board_ids, dead_mask, opp_discard_id,
     opp_vpip, opp_agg, opp_fold_pre, opp_fold_post, opp_sd_loose,
-    is_button, opp_raised, cumulative_net, score_cap, budget_ms=6.5
+    is_button, opp_raised, cumulative_net, score_cap,
+    opp_known3_ids=None, preview_flop_ids=None, preview_board_ids=None, budget_ms=4.5
 ):
     t_end = time.perf_counter() + (budget_ms * 0.001)
 
@@ -321,28 +489,51 @@ def py_choose_action(
     is_overfolder = (opp_fold > 0.55)
     is_station = (eff_vpip > 0.70 and opp_fold < 0.30)
 
-    rng = random.Random()
-    nb = len(board_ids)
+    used = set(hole_ids) | set(board_ids)
+    for c in range(52):
+        if (dead_mask >> c) & 1:
+            used.add(c)
 
-    if nb == 0 and len(hole_ids) >= 3:
+    nb = len(board_ids)
+    needed_board = max(0, 5 - nb)
+
+    # Duplicate-deal mirror validation
+    known = False
+    k_extras = []
+    k_flop_fixed = []
+    if opp_known3_ids and len(opp_known3_ids) == 3 and len(set(opp_known3_ids)) == 3:
+        chk_used = set(used)
+        if opp_discard_id >= 0:
+            chk_used.discard(opp_discard_id)
+        if not any(c in chk_used for c in opp_known3_ids):
+            if opp_discard_id < 0 or opp_discard_id in opp_known3_ids:
+                known = True
+                used.update(opp_known3_ids)
+                if preview_board_ids:
+                    cand_ex = [c for c in preview_board_ids if c not in board_ids]
+                    if len(cand_ex) <= needed_board and not any(c in used for c in cand_ex):
+                        k_extras = cand_ex
+                if nb == 0:
+                    if preview_flop_ids and len(preview_flop_ids) == 3 and not any(c in used for c in preview_flop_ids):
+                        k_flop_fixed = list(preview_flop_ids)
+                    else:
+                        k_extras = []
+
+    rng = random.Random()
+
+    if nb == 0 and len(hole_ids) >= 3 and not known:
         equity = lookup_preflop_3card(hole_ids)
         if not is_maniac and to_call > 0.0:
             if bet_frac >= 0.75: equity -= 0.035
             elif bet_frac >= 0.35: equity -= 0.020
         equity = max(0.05, min(0.95, equity))
     else:
-        used = set(hole_ids) | set(board_ids)
-        for c in range(52):
-            if (dead_mask >> c) & 1:
-                used.add(c)
-        avail = [c for c in range(52) if c not in used]
-
+        avail = [c for c in range(52) if c not in used and c not in k_extras]
         cands = (
             [(hole_ids[1], hole_ids[2]), (hole_ids[0], hole_ids[2]), (hole_ids[0], hole_ids[1])]
             if len(hole_ids) == 3 else [(hole_ids[0], hole_ids[1])]
         )
         ncand = len(cands)
-        eq_sums = [0.0] * ncand
 
         min_opp_str = 0
         if not is_maniac and to_call > 0.0:
@@ -352,99 +543,109 @@ def py_choose_action(
             else: min_opp_str = max(0, 130 - sd_off)
 
         passive_cap = (nb >= 4 and opp_raised == 0 and opp_agg >= 0.12)
-        board_rmask = 0
-        for bc in board_ids:
-            board_rmask |= (1 << (bc % 13))
-        board_only_5 = _eval5_fast(*board_ids[:5]) if nb == 5 else 0
         has_flop = (len(flop_board_ids) == 3)
-        if has_flop:
-            fb0, fb1, fb2 = flop_board_ids[0], flop_board_ids[1], flop_board_ids[2]
+        fb0 = flop_board_ids[0] if has_flop else 0
+        fb1 = flop_board_ids[1] if has_flop else 0
+        fb2 = flop_board_ids[2] if has_flop else 0
 
-        # Invest idle time bank into deeper postflop Monte Carlo precision
-        max_iters = 360 if pot >= 36 else (180 if pot <= 12 and to_call == 0 else 260)
-        sample_fn = rng.sample
-        eval7 = _eval7_fast
-        pair_str = _PAIR_STR
-        iters = 0
+        # Exact River (C(43,2)=903 pairs, zero MC noise) & Exact Turn
+        if not known and ncand == 1 and nb == 5:
+            equity = _exact_river_equity(
+                board_ids, cands[0][0], cands[0][1], avail, opp_discard_id,
+                has_flop, fb0, fb1, fb2, min_opp_str, passive_cap
+            )
+        elif not known and ncand == 1 and nb == 4:
+            equity = _exact_turn_equity(
+                board_ids, cands[0][0], cands[0][1], avail, opp_discard_id,
+                has_flop, fb0, fb1, fb2, min_opp_str, passive_cap, t_end
+            )
+        else:
+            eq_sums = [0.0] * ncand
+            max_iters = 260 if pot >= 36 else (140 if pot <= 12 and to_call == 0 else 200)
+            k_det = known and ((nb == 0 and len(k_extras) == 5) or (nb > 0 and len(k_extras) == needed_board))
+            sample_fn = rng.sample
+            eval7 = _eval7_fast
+            pair_str = _PAIR_STR
+            iters = 0
 
-        while iters < max_iters:
-            if (iters & 31) == 31:
-                if time.perf_counter() >= t_end:
+            while iters < max_iters:
+                if k_det and iters >= 1:
                     break
-                if iters >= 160:
-                    cur_eq = max(eq_sums) / iters
-                    if cur_eq >= 0.85 or cur_eq <= 0.13:
-                        break
+                if (iters & 31) == 31 and time.perf_counter() >= t_end:
+                    break
 
-            o0 = o1 = 0
-            r3 = r4 = 0
-            for att in range(10):
-                if nb == 3:
-                    o0, o1, r3, r4 = sample_fn(avail, 4)
-                elif nb == 4:
-                    o0, o1, r4 = sample_fn(avail, 3)
-                elif nb == 5:
-                    o0, o1 = sample_fn(avail, 2)
-                else:
-                    d7 = sample_fn(avail, 7)
-                    o0, o1 = d7[0], d7[1]
+                if known:
+                    if nb == 0:
+                        if k_flop_fixed:
+                            ff0, ff1, ff2 = k_flop_fixed[0], k_flop_fixed[1], k_flop_fixed[2]
+                            need = 5 - len(k_extras)
+                            runout = k_extras + (sample_fn(avail, need) if need > 0 else [])
+                        else:
+                            runout = sample_fn(avail, 5)
+                            ff0, ff1, ff2 = runout[0], runout[1], runout[2]
+                        fb = tuple(runout)
+                    else:
+                        ff0, ff1, ff2 = (fb0, fb1, fb2) if has_flop else (board_ids[0], board_ids[1], board_ids[2])
+                        need = needed_board - len(k_extras)
+                        runout = k_extras + (sample_fn(avail, need) if need > 0 else [])
+                        fb = tuple(board_ids) + tuple(runout)
 
-                if att < 9:
                     if opp_discard_id >= 0:
-                        if has_flop:
-                            v12 = _flop_keep_val(fb0, fb1, fb2, o0, o1)
-                            if v12 < _flop_keep_val(fb0, fb1, fb2, o0, opp_discard_id) or v12 < _flop_keep_val(fb0, fb1, fb2, o1, opp_discard_id):
-                                continue
-                        else:
-                            s12 = pair_str[o0][o1]
-                            if s12 < pair_str[o0][opp_discard_id] or s12 < pair_str[o1][opp_discard_id]:
-                                continue
+                        rem2 = [c for c in opp_known3_ids if c != opp_discard_id]
+                        opp_opts = [((rem2[0], rem2[1]), 1.0)]
+                    else:
+                        opp_opts = _known_keep_opts(opp_known3_ids, ff0, ff1, ff2)
 
-                    s12 = pair_str[o0][o1]
-                    board_hit = False
-                    if nb >= 3:
-                        if nb == 5:
-                            board_hit = (eval7(board_ids[0], board_ids[1], board_ids[2], board_ids[3], board_ids[4], o0, o1) > board_only_5)
-                        else:
-                            r_a, r_b = o0 % 13, o1 % 13
-                            if r_a == r_b or (board_rmask & ((1 << r_a) | (1 << r_b))) or _has_board_draw(board_ids, o0, o1):
-                                board_hit = True
-                    if s12 < min_opp_str and not board_hit:
-                        continue
-                    if passive_cap and s12 >= 600 and rng.random() < 0.70:
-                        continue
-                break
+                    osc = [eval7(fb[0], fb[1], fb[2], fb[3], fb[4], om[0], om[1]) for om, _ in opp_opts]
+                    for idx, (m0, m1) in enumerate(cands):
+                        my_sc = eval7(fb[0], fb[1], fb[2], fb[3], fb[4], m0, m1)
+                        for j, (_, w) in enumerate(opp_opts):
+                            if my_sc > osc[j]: eq_sums[idx] += w
+                            elif my_sc == osc[j]: eq_sums[idx] += 0.5 * w
+                    iters += 1
+                    continue
 
-            if nb == 3:
-                b0, b1, b2 = board_ids[0], board_ids[1], board_ids[2]
-                opp_sc = eval7(b0, b1, b2, r3, r4, o0, o1)
-                for idx, (m0, m1) in enumerate(cands):
-                    my_sc = eval7(b0, b1, b2, r3, r4, m0, m1)
-                    if my_sc > opp_sc: eq_sums[idx] += 1.0
-                    elif my_sc == opp_sc: eq_sums[idx] += 0.5
-            elif nb == 4:
-                b0, b1, b2, b3 = board_ids[0], board_ids[1], board_ids[2], board_ids[3]
-                opp_sc = eval7(b0, b1, b2, b3, r4, o0, o1)
-                for idx, (m0, m1) in enumerate(cands):
-                    my_sc = eval7(b0, b1, b2, b3, r4, m0, m1)
-                    if my_sc > opp_sc: eq_sums[idx] += 1.0
-                    elif my_sc == opp_sc: eq_sums[idx] += 0.5
-            elif nb == 5:
-                b0, b1, b2, b3, b4 = board_ids[0], board_ids[1], board_ids[2], board_ids[3], board_ids[4]
-                opp_sc = eval7(b0, b1, b2, b3, b4, o0, o1)
-                for idx, (m0, m1) in enumerate(cands):
-                    my_sc = eval7(b0, b1, b2, b3, b4, m0, m1)
-                    if my_sc > opp_sc: eq_sums[idx] += 1.0
-                    elif my_sc == opp_sc: eq_sums[idx] += 0.5
-            else:
-                opp_sc = eval7(d7[2], d7[3], d7[4], d7[5], d7[6], o0, o1)
-                for idx, (m0, m1) in enumerate(cands):
-                    my_sc = eval7(d7[2], d7[3], d7[4], d7[5], d7[6], m0, m1)
-                    if my_sc > opp_sc: eq_sums[idx] += 1.0
-                    elif my_sc == opp_sc: eq_sums[idx] += 0.5
-            iters += 1
+                # Standard flop / preflop MC with range filtering
+                o0 = o1 = r3 = r4 = 0
+                d7 = None
+                for att in range(10):
+                    if nb == 3:
+                        o0, o1, r3, r4 = sample_fn(avail, 4)
+                    else:
+                        d7 = sample_fn(avail, 7)
+                        o0, o1 = d7[0], d7[1]
 
-        equity = (max(eq_sums) / iters) if iters > 0 else 0.5
+                    if att < 9:
+                        if opp_discard_id >= 0:
+                            if has_flop:
+                                v12 = _flop_keep_val(fb0, fb1, fb2, o0, o1)
+                                if v12 < _flop_keep_val(fb0, fb1, fb2, o0, opp_discard_id) or v12 < _flop_keep_val(fb0, fb1, fb2, o1, opp_discard_id):
+                                    continue
+                            else:
+                                s12 = pair_str[o0][o1]
+                                if s12 < pair_str[o0][opp_discard_id] or s12 < pair_str[o1][opp_discard_id]:
+                                    continue
+                        s12 = pair_str[o0][o1]
+                        if s12 < min_opp_str:
+                            continue
+                    break
+
+                if nb == 3:
+                    b0, b1, b2 = board_ids[0], board_ids[1], board_ids[2]
+                    opp_sc = eval7(b0, b1, b2, r3, r4, o0, o1)
+                    for idx, (m0, m1) in enumerate(cands):
+                        my_sc = eval7(b0, b1, b2, r3, r4, m0, m1)
+                        if my_sc > opp_sc: eq_sums[idx] += 1.0
+                        elif my_sc == opp_sc: eq_sums[idx] += 0.5
+                else:
+                    opp_sc = eval7(d7[2], d7[3], d7[4], d7[5], d7[6], o0, o1)
+                    for idx, (m0, m1) in enumerate(cands):
+                        my_sc = eval7(d7[2], d7[3], d7[4], d7[5], d7[6], m0, m1)
+                        if my_sc > opp_sc: eq_sums[idx] += 1.0
+                        elif my_sc == opp_sc: eq_sums[idx] += 0.5
+                iters += 1
+
+            equity = (max(eq_sums) / iters) if iters > 0 else 0.5
 
     if to_call > 0.0 and (nb == 3 or nb == 4):
         equity += 0.015 if is_button == 1 else -0.025
@@ -466,6 +667,8 @@ def py_choose_action(
             return ("fold", 0)
 
         raise_thresh = (0.57 if is_station else 0.64) + cap_protect
+        if nb == 0 and my_bet >= 4 and opp_agg > 0.35:
+            raise_thresh -= 0.03
         if can_raise and equity >= raise_thresh:
             base_mult = 1.0 if equity >= 0.78 else 0.68
             if is_station:
@@ -500,8 +703,11 @@ def py_choose_action(
                 return ("call" if "call" in legal else "check", 0)
         if opp_agg < 0.12 and bet_frac > 0.8:
             risk_buffer += pot * 0.06
-        if nb == 0 and is_button == 0 and bet_frac >= 0.75:
-            risk_buffer += pot * 0.03
+        if nb == 0 and bet_frac >= 0.75:
+            if is_button == 0:
+                risk_buffer += pot * 0.03
+            elif my_bet >= 4 and eff_vpip < 0.45 and opp_agg < 0.25:
+                risk_buffer += pot * 0.05
 
         if call_ev >= risk_buffer:
             return ("call" if "call" in legal else "check", 0)
