@@ -344,7 +344,7 @@ def _exact_turn_equity(board_ids, m0, m1, avail, opp_d, has_flop, fb0, fb1, fb2,
     u_cnt = 0
     r_order = list(range(nu))
     random.shuffle(r_order)
-    for step, r_idx in enumerate(r_order[:10]):
+    for step, r_idx in enumerate(r_order):
         if step >= 1 and time.perf_counter() >= t_end:
             break
         rc = avail[r_idx]
@@ -389,7 +389,7 @@ def py_choose_discard(hole_ids, board_ids, dead_mask, budget_ms=3.5):
     pairs = ((h1, h2), (h0, h2), (h0, h1))
 
     iters = 0
-    while iters < 240:
+    while iters < 420:
         if (iters & 31) == 31 and time.perf_counter() >= t_end:
             break
 
@@ -476,8 +476,9 @@ def py_choose_action(
         min_opp_str = 0
         if not is_maniac and to_call > 0.0:
             sd_off = int(opp_sd_loose * 30.0)
-            if bet_frac >= 0.75: min_opp_str = max(0, 210 - sd_off)
-            elif bet_frac >= 0.35: min_opp_str = max(0, 165 - sd_off)
+            tight_bonus = 45 if (eff_vpip < 0.42 and opp_agg < 0.35) else 0
+            if bet_frac >= 0.65: min_opp_str = max(0, 215 + tight_bonus - sd_off)
+            elif bet_frac >= 0.35: min_opp_str = max(0, 170 + (tight_bonus // 2) - sd_off)
             else: min_opp_str = max(0, 130 - sd_off)
 
         passive_cap = (nb >= 4 and opp_raised == 0 and opp_agg >= 0.12)
@@ -499,7 +500,7 @@ def py_choose_action(
             )
         else:
             eq_sums = [0.0] * ncand
-            max_iters = 260 if pot >= 36 else (140 if pot <= 12 and to_call == 0 else 200)
+            max_iters = 560 if pot >= 36 else (300 if pot <= 12 and to_call == 0 else 420)
             sample_fn = rng.sample
             eval7 = _eval7_fast
             pair_str = _PAIR_STR
@@ -624,7 +625,10 @@ def py_choose_action(
 
         value_thresh = (0.50 if is_station else 0.58) + cap_protect
         if equity >= value_thresh:
-            base_frac = 0.85 if equity >= 0.75 else 0.55
+            if nb == 5 and equity >= 0.86 and opp_fold < 0.65:
+                base_frac = 1.22
+            else:
+                base_frac = 0.88 if equity >= 0.75 else 0.55
             if is_station:
                 base_frac += 0.25
             frac = max(0.33, base_frac + jitter)
@@ -637,10 +641,15 @@ def py_choose_action(
         if is_station or is_maniac or cap_protect > 0.0:
             bluff_pct = 0.0
         elif is_overfolder:
-            bluff_pct = 0.58
+            bluff_pct = 0.56
+        elif opp_fold < 0.42:
+            bluff_pct = 0.08
 
-        if equity >= 0.44 and rng.random() < bluff_pct:
-            frac = max(0.28, 0.36 + jitter * 0.5)
+        # On river, never turn medium showdown pairs (0.36..0.55) into bluffs; bluff missed draws with blockers
+        has_blocker = any((c % 13) == 12 for c in hole_ids[:2])
+        can_bluff = (0.12 <= equity <= 0.34 and (has_blocker or is_overfolder)) if nb == 5 else (equity >= 0.44)
+        if can_bluff and rng.random() < bluff_pct:
+            frac = max(0.30, (0.62 if nb == 5 else 0.38) + jitter * 0.5)
             target = int(opp_bet + pot * frac)
             bet_amt = max(min_raise, min(max_raise, target))
             if bet_amt >= min_raise:
@@ -699,7 +708,7 @@ def _compute_dynamic_budget_ms(time_left_ms, hands_played, total_hands, pot, str
         base *= 1.20
     if street in ("turn", "river"):
         base *= 1.15
-    lo, hi = (1.5, 4.0) if is_discard else (1.8, 5.5)
+    lo, hi = (2.4, 6.0) if is_discard else (3.0, 9.5)
     return max(lo, min(hi, base))
 
 
